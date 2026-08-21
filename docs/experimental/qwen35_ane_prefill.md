@@ -116,6 +116,17 @@ prioritizes MLPs within its 120-program budget and logs when GDN layers are
 dropped instead of leaving them silently on the GPU, and benchmark traces
 report the compiled MLP and GDN counts alongside the configured ones.
 
+Set `OMLX_QWEN35_ANE_COMPILE_CACHE=1` to let later processes reuse compiled
+ANE programs from Apple's own AOT cache. oMLX gives each program a stable
+model URL under `~/Library/Caches/omlx/ane/v1/<os-build>/` and uses
+`compiledModelExists` before compiling. The feature is opt-in and does not
+persist the MIL or weight staging files: those retain their historical
+delete-on-unload lifecycle, while Apple owns the compiled artifacts. The oMLX
+cache directory therefore retains only zero-byte cross-process lock files.
+Cache hits, misses, and corrupt-hit recompilation fallbacks are logged. An
+unavailable cache directory or lock fails open to the historical temporary
+compile path.
+
 The macOS app exposes the same controls under **Models → model settings →
 Advanced → Experimental → Qwen ANE Prefill** for detected Qwen3.5/3.6/3.8
 models. Enabling or changing a control reloads a resident model when the
