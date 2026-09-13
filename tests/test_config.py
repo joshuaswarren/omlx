@@ -171,6 +171,7 @@ class TestSchedulerConfig:
         """Test default configuration values."""
         config = SchedulerConfig()
         assert config.max_num_seqs == 8
+        assert config.max_waiting_requests is None
         assert config.completion_batch_size == 8
         assert config.embedding_batch_size == 32
         assert config.stream_interval == 1
@@ -180,12 +181,14 @@ class TestSchedulerConfig:
         """Test custom configuration values."""
         config = SchedulerConfig(
             max_num_seqs=128,
+            max_waiting_requests=0,
             completion_batch_size=16,
             embedding_batch_size=12,
             stream_interval=2,
             enable_thinking=True,
         )
         assert config.max_num_seqs == 128
+        assert config.max_waiting_requests == 0
         assert config.completion_batch_size == 16
         assert config.embedding_batch_size == 12
         assert config.stream_interval == 2

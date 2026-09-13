@@ -16,9 +16,11 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..utils.tokenizer import get_tokenizer_config
 from .base import (
+    AdmissionReservation,
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _reserve_scheduler_admission,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -86,8 +88,8 @@ class BatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-    ) -> None:
-        await _run_scheduler_preflight_with_cleanup_retry(
+    ) -> AdmissionReservation:
+        return await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
@@ -899,6 +901,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            admission_reservation_id=kwargs.pop("admission_reservation_id", None),
             **specprefill_kwargs,
         )
 
@@ -982,6 +985,7 @@ class BatchedEngine(BaseEngine):
             benchmark_ane_sequence_length=int(
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
             ),
+            admission_reservation_id=kwargs.pop("admission_reservation_id", None),
             **specprefill_kwargs,
         )
 
@@ -1116,7 +1120,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Early prefill memory check for chat completions.
 
         Tokenizes the templated prompt and asks the scheduler whether the
@@ -1133,6 +1137,15 @@ class BatchedEngine(BaseEngine):
         """
         if not self._loaded:
             await self.start()
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_chat")
+            return None
+        executor = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "_mlx_executor",
+            None,
+        )
         messages = self._preprocess_messages(messages)
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
@@ -1143,14 +1156,6 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=ct_kwargs,
             is_partial=partial,
         )
-        # Tokenizer errors (UnicodeDecodeError, HF Rust "Already borrowed",
-        # malformed input) are normally surfaced by the real chat path's
-        # add_request → tokenize call as a 500 — there's no path-specific
-        # 400 handler today. Don't introduce a NEW failure mode here: if
-        # tokenization fails during preflight, log it and skip the memory
-        # check. The actual chat path will hit the same error and raise it
-        # through the existing handler chain so the response shape stays
-        # consistent.
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -1160,12 +1165,8 @@ class BatchedEngine(BaseEngine):
                 "the error",
                 type(e).__name__,
             )
-            return
-        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
-        if scheduler is None:
-            _warn_scheduler_unreachable_once(self, "preflight_chat")
-            return
-        await self._preflight_or_raise_with_eviction(
+            return await _reserve_scheduler_admission(scheduler, executor)
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
@@ -1174,13 +1175,22 @@ class BatchedEngine(BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Early prefill memory check for plain /v1/completions calls.
 
         See ``preflight_chat`` for the rationale.
         """
         if not self._loaded:
             await self.start()
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_completion")
+            return None
+        executor = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "_mlx_executor",
+            None,
+        )
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -1190,12 +1200,8 @@ class BatchedEngine(BaseEngine):
                 "will surface the error",
                 type(e).__name__,
             )
-            return
-        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
-        if scheduler is None:
-            _warn_scheduler_unreachable_once(self, "preflight_completion")
-            return
-        await self._preflight_or_raise_with_eviction(
+            return await _reserve_scheduler_admission(scheduler, executor)
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 

@@ -18,6 +18,7 @@ import math
 import re
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from ..adapter.output_parser import detect_output_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.observability import CacheRateTracker
+from ..exceptions import SchedulerQueueFullError
 from ..memory_monitor import (
     MemoryMonitor,
     raise_if_prefill_exceeds,
@@ -40,6 +42,7 @@ from ..utils.proc_memory import get_phys_footprint
 from ..utils.tokenizer import create_streaming_detokenizer
 from .base import (
     ActivityTrackingMixin,
+    AdmissionReservation,
     BaseEngine,
     GenerationOutput,
     _warn_scheduler_unreachable_once,
@@ -340,6 +343,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
         self._fallback_lock = asyncio.Lock()
+        self._primary_admission_lock = threading.Lock()
+        self._primary_admission_ids: set[str] = set()
         # Primary-mode prefill memory guard. DFlash bypasses the scheduler, so
         # it can't receive the enforcer's watermarks through one; this holder
         # stands in (built in start(), resolved by the enforcer).
@@ -860,6 +865,8 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._output_parser_factory = None
         self._prefill_guard = None
         self._in_fallback_mode = False
+        with self._primary_admission_lock:
+            self._primary_admission_ids.clear()
         self._loaded = False
         # Revert class-level __call__ patches dflash installed during start().
         # Required so a subsequent Native MTP load on the same process sees
@@ -957,56 +964,100 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         )
         return len(self._tokenizer_obj.encode(prompt))
 
+    def _reserve_primary_admission(self) -> AdmissionReservation:
+        reservation_id = f"dflash-primary-{uuid.uuid4().hex}"
+        config = self._scheduler_config
+        max_active = max(1, int(getattr(config, "max_num_seqs", 1)))
+        configured_waiting = getattr(config, "max_waiting_requests", None)
+        max_waiting = (
+            max(max_active * 4, 32)
+            if configured_waiting is None
+            else max(0, int(configured_waiting))
+        )
+        with self._primary_admission_lock:
+            occupied = len(self._primary_admission_ids)
+            if occupied >= max_active + max_waiting:
+                raise SchedulerQueueFullError(
+                    current_depth=max(0, occupied - max_active),
+                    max_depth=max_waiting,
+                )
+            self._primary_admission_ids.add(reservation_id)
+        return AdmissionReservation(self, reservation_id)
+
+    def release_request_admission(self, admission_id: str) -> None:
+        with self._primary_admission_lock:
+            self._primary_admission_ids.discard(admission_id)
+
+    def _raise_if_primary_admitted(self) -> None:
+        with self._primary_admission_lock:
+            occupied = len(self._primary_admission_ids)
+        if occupied:
+            raise SchedulerQueueFullError(current_depth=occupied, max_depth=0)
+
     async def preflight_chat(
         self,
         messages: list,
         tools: list | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
-        """Prefill-memory preflight for chat requests.
-
-        DFlash bypasses the scheduler, so it implements the front-door guard
-        itself (BaseEngine's no-op would leave primary-mode prefills
-        unprotected). In fallback mode it delegates to the fallback engine,
-        whose scheduler runs the full guard. Raises ``PrefillMemoryExceededError``
-        (→ HTTP 400) when the prompt's prefill peak would exceed the ceiling.
-        Mirrors ``BatchedEngine.preflight_chat``.
-        """
+    ) -> AdmissionReservation | None:
         if not self._loaded:
             await self.start()
         if self._in_fallback_mode and self._fallback_engine is not None:
-            await self._fallback_engine.preflight_chat(
+            return await self._fallback_engine.preflight_chat(
                 messages, tools=tools, request_id=request_id, **kwargs
             )
-            return
-        if self._prefill_guard is None:
-            _warn_scheduler_unreachable_once(
-                self, "preflight_chat", "primary-mode prefill guard unavailable"
-            )
-            return
-        try:
-            num_tokens = self.count_chat_tokens(
-                messages,
-                tools,
-                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
-                is_partial=kwargs.get("is_partial"),
-            )
-        except Exception as e:
-            logger.warning(
-                "DFlashEngine.preflight_chat: token count raised %s; skipping "
-                "prefill memory check, real chat path will surface the error",
-                type(e).__name__,
-            )
-            return
-        # Deliberately no cached_tokens: a DFlash prefix-cache hit
-        # *reconstructs* the matched KV into active memory (dflash_mlx
-        # ``hydrate_target_cache`` clones every array), so the full prompt's
-        # KV is allocated this request — unlike the scheduler's resident
-        # paged cache. Subtracting hit tokens here would under-count and
-        # defeat the OOM guard.
-        self._prefill_guard.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+
+        needs_fallback = (
+            self._fallback_engine_type == "vlm"
+            and self._has_multimodal_content(messages)
+        )
+        num_tokens = None
+        if not needs_fallback:
+            try:
+                num_tokens = self.count_chat_tokens(
+                    messages,
+                    tools,
+                    chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+                    is_partial=kwargs.get("is_partial"),
+                )
+            except Exception as e:
+                logger.warning(
+                    "DFlashEngine.preflight_chat: token count raised %s; "
+                    "skipping prefill memory check, real chat path will surface "
+                    "the error",
+                    type(e).__name__,
+                )
+            else:
+                needs_fallback = (
+                    self._max_dflash_ctx is not None
+                    and num_tokens >= self._max_dflash_ctx
+                )
+
+        fallback_engine = None
+        async with self._fallback_lock:
+            if self._in_fallback_mode:
+                fallback_engine = self._fallback_engine
+            elif needs_fallback:
+                self._raise_if_primary_admitted()
+                await self._evict_dflash_and_start_fallback()
+                fallback_engine = self._fallback_engine
+            else:
+                if num_tokens is not None:
+                    if self._prefill_guard is None:
+                        _warn_scheduler_unreachable_once(
+                            self,
+                            "preflight_chat",
+                            "primary-mode prefill guard unavailable",
+                        )
+                    else:
+                        self._prefill_guard.preflight_or_raise(
+                            num_prompt_tokens=num_tokens, request_id=request_id
+                        )
+                return self._reserve_primary_admission()
+
+        return await fallback_engine.preflight_chat(
+            messages, tools=tools, request_id=request_id, **kwargs
         )
 
     async def preflight_completion(
@@ -1014,22 +1065,15 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
-        """Prefill-memory preflight for plain completions. See ``preflight_chat``."""
+    ) -> AdmissionReservation | None:
         if not self._loaded:
             await self.start()
         if self._in_fallback_mode and self._fallback_engine is not None:
-            await self._fallback_engine.preflight_completion(
+            return await self._fallback_engine.preflight_completion(
                 prompt, request_id=request_id, **kwargs
             )
-            return
-        if self._prefill_guard is None:
-            _warn_scheduler_unreachable_once(
-                self,
-                "preflight_completion",
-                "primary-mode prefill guard unavailable",
-            )
-            return
+
+        num_tokens = None
         try:
             num_tokens = len(self._tokenizer_obj.encode(prompt))
         except Exception as e:
@@ -1039,12 +1083,36 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
                 "surface the error",
                 type(e).__name__,
             )
-            return
-        # Deliberately no cached_tokens — see preflight_chat: a prefix-cache
-        # hit reconstructs KV into active memory, so the full prompt is
-        # charged.
-        self._prefill_guard.preflight_or_raise(
-            num_prompt_tokens=num_tokens, request_id=request_id
+        needs_fallback = (
+            num_tokens is not None
+            and self._max_dflash_ctx is not None
+            and num_tokens >= self._max_dflash_ctx
+        )
+
+        fallback_engine = None
+        async with self._fallback_lock:
+            if self._in_fallback_mode:
+                fallback_engine = self._fallback_engine
+            elif needs_fallback:
+                self._raise_if_primary_admitted()
+                await self._evict_dflash_and_start_fallback()
+                fallback_engine = self._fallback_engine
+            else:
+                if num_tokens is not None:
+                    if self._prefill_guard is None:
+                        _warn_scheduler_unreachable_once(
+                            self,
+                            "preflight_completion",
+                            "primary-mode prefill guard unavailable",
+                        )
+                    else:
+                        self._prefill_guard.preflight_or_raise(
+                            num_prompt_tokens=num_tokens, request_id=request_id
+                        )
+                return self._reserve_primary_admission()
+
+        return await fallback_engine.preflight_completion(
+            prompt, request_id=request_id, **kwargs
         )
 
     @property

@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from array import array
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable
@@ -1524,6 +1525,9 @@ class SchedulerConfig:
 
     # Maximum number of concurrent requests in the batch
     max_num_seqs: int = 256
+    # Maximum requests allowed to wait beyond occupied execution slots.
+    # None preserves the legacy waiting-only cap.
+    max_waiting_requests: int | None = None
     # Maximum tokens to process per step (for prefill chunking)
     max_num_batched_tokens: int = 8192
     # Scheduling policy
@@ -1845,6 +1849,8 @@ class Scheduler:
         self.requests: dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: set[str] = set()  # Recently finished
         self._generation_overflow_recovery_ids: set[str] = set()
+        self._admission_lock = threading.Lock()
+        self._admission_request_ids: set[str] = set()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -4485,7 +4491,15 @@ class Scheduler:
         self._store_cache_admission_blocked_request_id = None
         self._store_cache_admission_blocked_since = 0.0
 
-    def _clear_request_admission_bookkeeping(self, request_id: str) -> None:
+    def release_request_admission(self, admission_id: str) -> None:
+        with self._admission_lock:
+            self._admission_request_ids.discard(admission_id)
+
+    def _clear_request_admission_bookkeeping(
+        self, request_id: str, *, release_admission: bool = True
+    ) -> None:
+        if release_admission:
+            self.release_request_admission(request_id)
         self._cache_freshness_waits.pop(request_id, None)
         self._prefix_cache_prepared.discard(request_id)
         self._throttle_notified_requests.discard(request_id)
@@ -5522,7 +5536,9 @@ class Scheduler:
                 self._release_paged_cache_for_request(rid)
                 self._drop_boundary_snapshots_for_request(rid)
                 self.requests.pop(rid, None)
-                self._clear_request_admission_bookkeeping(rid)
+                self._clear_request_admission_bookkeeping(
+                    rid, release_admission=False
+                )
                 get_prefill_tracker().remove(rid)
                 # Drop Metal cache pool buffers held by the aborted chunk's
                 # forward / mx.eval transients. Without this, enforcer keeps
@@ -5534,6 +5550,7 @@ class Scheduler:
                 # non-memory errors) do we emit the client-facing error.
                 if self._requeue_or_fail_prefill(request, e):
                     continue
+                self.release_request_admission(rid)
                 # Surface the failure to the engine. Without this, the
                 # request is silently dropped and the client hangs.
                 rejected.append(
@@ -8272,61 +8289,78 @@ class Scheduler:
         self._try_specprefill_scoring(request)
         self._prefix_cache_prepared.add(request.request_id)
 
-    def add_request(self, request: Request) -> None:
-        """
-        Add a new request to the scheduler.
+    def reserve_request_admission(self, request_id: str | None = None) -> str:
+        from .exceptions import SchedulerQueueFullError
 
-        Raises SchedulerQueueFullError when the waiting queue is at or above
-        the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
-        this to HTTP 503 + Retry-After.
+        admission_id = request_id or f"reservation-{uuid.uuid4().hex}"
+        with self._admission_lock:
+            if admission_id in self.requests or admission_id in self._admission_request_ids:
+                raise ValueError(f"Request {admission_id} already exists")
 
-        Args:
-            request: The request to add
-        """
-        if request.request_id in self.requests:
-            raise ValueError(f"Request {request.request_id} already exists")
-
-        # Cap the waiting queue so client-side polling can't accumulate
-        # unbounded work and the scheduler can apply backpressure via 503.
-        max_waiting = max(self.config.max_num_seqs * 4, 32)
-        if len(self.waiting) >= max_waiting:
-            from .exceptions import SchedulerQueueFullError
-
-            raise SchedulerQueueFullError(
-                current_depth=len(self.waiting),
-                max_depth=max_waiting,
-            )
-
-        # Tokenize if needed
-        if request.prompt_token_ids is None:
-            if isinstance(request.prompt, str):
-                request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+            configured_waiting = self.config.max_waiting_requests
+            if configured_waiting is None:
+                max_waiting = max(self.config.max_num_seqs * 4, 32)
+                current_waiting = len(self.waiting) + sum(
+                    admission_id not in self.requests
+                    for admission_id in self._admission_request_ids
+                )
+                full = current_waiting >= max_waiting
             else:
-                request.prompt_token_ids = list(request.prompt)
-            request.num_prompt_tokens = len(request.prompt_token_ids)
+                max_waiting = configured_waiting
+                active_capacity = self._effective_max_num_seqs()
+                occupied = len(self._admission_request_ids)
+                current_waiting = max(0, occupied - active_capacity)
+                full = occupied >= active_capacity + max_waiting
 
-        # Prefix-cache lookup is intentionally delayed until admission. That
-        # lets a same-prefix request wait for a relevant in-flight store_cache
-        # without blocking the scheduler lane that continues decode/prefill.
-        #
-        # Keep the immediate preflight only when no prefix cache lookup can
-        # change cached_tokens. With a block-aware cache, the in-stream
-        # _preflight_memory_check runs after lookup with the final cache state.
-        if self.block_aware_cache is None:
-            request.remaining_tokens = request.prompt_token_ids
-            try:
+            if full:
+                raise SchedulerQueueFullError(
+                    current_depth=current_waiting,
+                    max_depth=max_waiting,
+                )
+            self._admission_request_ids.add(admission_id)
+        return admission_id
+
+    def add_request(
+        self, request: Request, admission_reservation_id: str | None = None
+    ) -> None:
+        """Add a request or raise when this model has no admission capacity."""
+        if admission_reservation_id is None:
+            self.reserve_request_admission(request.request_id)
+        else:
+            with self._admission_lock:
+                if admission_reservation_id not in self._admission_request_ids:
+                    raise ValueError("Invalid or expired admission reservation")
+                if request.request_id in self.requests or (
+                    request.request_id in self._admission_request_ids
+                    and request.request_id != admission_reservation_id
+                ):
+                    raise ValueError(f"Request {request.request_id} already exists")
+                self._admission_request_ids.remove(admission_reservation_id)
+                self._admission_request_ids.add(request.request_id)
+
+        try:
+            if request.prompt_token_ids is None:
+                if isinstance(request.prompt, str):
+                    request.prompt_token_ids = self.tokenizer.encode(request.prompt)
+                else:
+                    request.prompt_token_ids = list(request.prompt)
+                request.num_prompt_tokens = len(request.prompt_token_ids)
+
+            if self.block_aware_cache is None:
+                request.remaining_tokens = request.prompt_token_ids
                 self.preflight_or_raise(
                     num_prompt_tokens=request.num_prompt_tokens,
                     cached_tokens=request.cached_tokens or 0,
                     request_id=request.request_id,
                 )
-            except Exception:
-                self._release_paged_cache_for_request(request.request_id)
-                raise
+        except BaseException:
+            self._release_paged_cache_for_request(request.request_id)
+            self.release_request_admission(request.request_id)
+            raise
 
-        # Add to tracking
-        self.requests[request.request_id] = request
-        self.waiting.append(request)
+        with self._admission_lock:
+            self.requests[request.request_id] = request
+            self.waiting.append(request)
 
         logger.debug(
             f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
@@ -10506,13 +10540,16 @@ class Scheduler:
                         )
                         self._release_paged_cache_for_request(request.request_id)
                         self.requests.pop(request.request_id, None)
-                        self._clear_request_admission_bookkeeping(request.request_id)
+                        self._clear_request_admission_bookkeeping(
+                            request.request_id, release_admission=False
+                        )
                         get_prefill_tracker().remove(request.request_id)
                         # Drop Metal cache pool buffers held by the aborted
                         # first chunk's forward / mx.eval transients.
                         _sync_and_clear_cache(self._stream)
                         if self._requeue_or_fail_prefill(request, e):
                             continue
+                        self.release_request_admission(request.request_id)
                         rejected_outputs.append(
                             RequestOutput(
                                 request_id=request.request_id,
@@ -10588,13 +10625,16 @@ class Scheduler:
                     self.request_id_to_uid.pop(request.request_id, None)
                     self._release_paged_cache_for_request(request.request_id)
                     self.requests.pop(request.request_id, None)
-                    self._clear_request_admission_bookkeeping(request.request_id)
+                    self._clear_request_admission_bookkeeping(
+                        request.request_id, release_admission=False
+                    )
                     get_prefill_tracker().remove(request.request_id)
                     # Drop Metal cache pool buffers held by the aborted
                     # chunk's forward / mx.eval transients.
                     _sync_and_clear_cache(self._stream)
                     if self._requeue_or_fail_prefill(request, e):
                         continue
+                    self.release_request_admission(request.request_id)
                     rejected_outputs.append(
                         RequestOutput(
                             request_id=request.request_id,
@@ -11052,10 +11092,8 @@ class Scheduler:
         # Remove finished requests from prefill progress tracker.
         tracker = get_prefill_tracker()
         for rid in finished_ids:
+            self.release_request_admission(rid)
             tracker.remove(rid)
-            # _clear_request_admission_bookkeeping only runs on abort/failure
-            # paths, so a request that was throttled and then completed
-            # normally would keep its id here forever.
             self._throttle_notified_requests.discard(rid)
 
         for request_id in finished_ids:
@@ -12250,6 +12288,8 @@ class Scheduler:
         self._prefill_states.clear()
         self.running.clear()
         self.requests.clear()
+        with self._admission_lock:
+            self._admission_request_ids.clear()
         self.finished_req_ids.clear()
         _unregister_uid_rows_for_model(self.model)
         self.request_id_to_uid.clear()

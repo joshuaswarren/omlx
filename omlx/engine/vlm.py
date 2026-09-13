@@ -54,9 +54,11 @@ from ..utils.image import (
     extract_images_from_messages,
 )
 from .base import (
+    AdmissionReservation,
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _reserve_scheduler_admission,
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
@@ -1454,8 +1456,8 @@ class VLMBatchedEngine(BaseEngine):
         *,
         num_prompt_tokens: int,
         request_id: str | None,
-    ) -> None:
-        await _run_scheduler_preflight_with_cleanup_retry(
+    ) -> AdmissionReservation:
+        return await _run_scheduler_preflight_with_cleanup_retry(
             scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
@@ -3534,6 +3536,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            admission_reservation_id=kwargs.pop("admission_reservation_id", None),
             **specprefill_kwargs,
         )
 
@@ -3652,6 +3655,7 @@ class VLMBatchedEngine(BaseEngine):
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
             ),
             tools=tools,
+            admission_reservation_id=kwargs.pop("admission_reservation_id", None),
             **specprefill_kwargs,
         )
 
@@ -3785,7 +3789,7 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Early prefill memory check for chat completions (VLM path).
 
         The actual VLM prompt is built by ``_process_chat_messages`` →
@@ -3829,6 +3833,15 @@ class VLMBatchedEngine(BaseEngine):
                 kwargs=kwargs,
             )
             return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_chat")
+            return None
+        executor = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "_mlx_executor",
+            None,
+        )
         template_tools = convert_tools_for_template(tools) if tools else None
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
@@ -3865,7 +3878,7 @@ class VLMBatchedEngine(BaseEngine):
                 "surface the error",
                 type(e).__name__,
             )
-            return
+            return await _reserve_scheduler_admission(scheduler, executor)
         # Count images from the ORIGINAL messages (the stripped
         # ``text_messages`` no longer has the image content-parts).
         num_tokens += _count_image_tokens_real(
@@ -3875,11 +3888,7 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(self, "_processor", None)
             ),
         )
-        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
-        if scheduler is None:
-            _warn_scheduler_unreachable_once(self, "preflight_chat")
-            return
-        await self._preflight_or_raise_with_eviction(
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
@@ -3888,7 +3897,7 @@ class VLMBatchedEngine(BaseEngine):
         prompt: str,
         request_id: str | None = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Early prefill memory check for plain /v1/completions calls (VLM)."""
         if not self._loaded:
             await self.start()
@@ -3898,6 +3907,15 @@ class VLMBatchedEngine(BaseEngine):
                 kwargs=kwargs,
             )
             return
+        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
+        if scheduler is None:
+            _warn_scheduler_unreachable_once(self, "preflight_completion")
+            return None
+        executor = getattr(
+            getattr(getattr(self, "_engine", None), "engine", None),
+            "_mlx_executor",
+            None,
+        )
         try:
             num_tokens = len(self._tokenizer.encode(prompt))
         except Exception as e:
@@ -3907,12 +3925,8 @@ class VLMBatchedEngine(BaseEngine):
                 "path will surface the error",
                 type(e).__name__,
             )
-            return
-        scheduler = getattr(getattr(self._engine, "engine", None), "scheduler", None)
-        if scheduler is None:
-            _warn_scheduler_unreachable_once(self, "preflight_completion")
-            return
-        await self._preflight_or_raise_with_eviction(
+            return await _reserve_scheduler_admission(scheduler, executor)
+        return await self._preflight_or_raise_with_eviction(
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 

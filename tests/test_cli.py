@@ -259,6 +259,7 @@ class TestServeCommandOptions:
             timeout=10,
         )
         assert "--max-concurrent-requests" in result.stdout
+        assert "--max-waiting-requests" in result.stdout
         assert "--embedding-batch-size" in result.stdout
         assert "--max-audio-upload-size" in result.stdout
         assert "settings.json" in result.stdout
@@ -1298,6 +1299,7 @@ class TestHasCliOverrides:
             ("sse_keepalive_mode", "off"),
             ("max_audio_upload_size", "250MB"),
             ("max_concurrent_requests", 2),
+            ("max_waiting_requests", 0),
             ("paged_ssd_cache_dir", "/tmp/cache"),
             ("paged_ssd_cache_max_size", "2GB"),
             ("hot_cache_max_size", "1GB"),

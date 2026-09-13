@@ -12,6 +12,9 @@ These tests pin the guard math (mirroring ``test_scheduler_prefill_memory_guard`
 and the engine-level delegation so a refactor can't silently revert it.
 """
 
+import asyncio
+import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import mlx.core as mx
@@ -371,7 +374,18 @@ def _bare_engine() -> DFlashEngine:
     eng._loaded = True
     eng._in_fallback_mode = False
     eng._fallback_engine = None
+    eng._fallback_engine_type = "batched"
+    eng._fallback_lock = asyncio.Lock()
+    eng._primary_admission_lock = threading.Lock()
+    eng._primary_admission_ids = set()
+    eng._scheduler_config = SimpleNamespace(
+        max_num_seqs=1, max_waiting_requests=0
+    )
+    eng._max_dflash_ctx = None
     eng._prefill_guard = None
+    eng.count_chat_tokens = MagicMock(return_value=1)
+    eng._tokenizer_obj = MagicMock()
+    eng._tokenizer_obj.encode.return_value = [1]
     return eng
 
 

@@ -338,14 +338,18 @@ class TestSchedulerSettings:
         """Test default values."""
         settings = SchedulerSettings()
         assert settings.max_concurrent_requests == 8
+        assert settings.max_waiting_requests is None
         assert settings.embedding_batch_size == 32
 
     def test_custom_values(self):
         """Test custom values."""
         settings = SchedulerSettings(
-            max_concurrent_requests=128, embedding_batch_size=16
+            max_concurrent_requests=128,
+            max_waiting_requests=0,
+            embedding_batch_size=16,
         )
         assert settings.max_concurrent_requests == 128
+        assert settings.max_waiting_requests == 0
         assert settings.embedding_batch_size == 16
 
     def test_to_dict(self):
@@ -354,6 +358,7 @@ class TestSchedulerSettings:
         result = settings.to_dict()
         assert result == {
             "max_concurrent_requests": 8,
+            "max_waiting_requests": None,
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
@@ -393,6 +398,9 @@ class TestSchedulerSettings:
         settings = SchedulerSettings.from_dict(data)
         assert settings.max_concurrent_requests == 512
         assert settings.embedding_batch_size == 24
+
+        settings = SchedulerSettings.from_dict({"max_waiting_requests": 0})
+        assert settings.max_waiting_requests == 0
 
     def test_from_dict_backwards_compat(self):
         """Test creation from dictionary with old keys."""
@@ -1402,6 +1410,11 @@ class TestGlobalSettings:
         errors = settings.validate()
         assert errors == []
 
+    def test_validate_rejects_negative_waiting_capacity(self):
+        settings = GlobalSettings()
+        settings.scheduler.max_waiting_requests = -1
+        assert any("max_waiting_requests" in error for error in settings.validate())
+
     def test_validate_context_window_policy(self):
         """Sampling context policy must be positive when set."""
         settings = GlobalSettings()
@@ -2065,9 +2078,11 @@ class TestGlobalSettings:
         settings = GlobalSettings()
         settings.scheduler.max_concurrent_requests = 128
         settings.scheduler.embedding_batch_size = 12
+        settings.scheduler.max_waiting_requests = 0
 
         scheduler_config = settings.to_scheduler_config()
         assert scheduler_config.max_num_seqs == 128
+        assert scheduler_config.max_waiting_requests == 0
         assert scheduler_config.completion_batch_size == 128
         assert scheduler_config.embedding_batch_size == 12
         assert scheduler_config.initial_cache_blocks == 256  # default

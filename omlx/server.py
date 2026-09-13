@@ -59,6 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.background import BackgroundTask
 
 from omlx._version import __version__
 
@@ -176,6 +177,7 @@ from .api.utils import (
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
+from .engine.base import AdmissionReservation
 from .engine.distributed import DistributedInferenceError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1274,14 +1276,25 @@ class _LLMEngineLease:
     """Release handle for an LLM engine lease taken from EnginePool."""
 
     model_id: str | None = None
+    admission_reservations: list[AdmissionReservation] = field(default_factory=list)
     released: bool = False
+
+    def hold_admission(self, reservation: AdmissionReservation | None) -> None:
+        if reservation is not None:
+            self.admission_reservations.append(reservation)
 
     async def release(self) -> None:
         if self.released:
             return
         self.released = True
-        if self.model_id is not None:
-            await get_engine_pool().release_engine(self.model_id)
+        reservations = self.admission_reservations
+        self.admission_reservations = []
+        try:
+            for reservation in reservations:
+                reservation.release()
+        finally:
+            if self.model_id is not None:
+                await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
         return self.abort_reason() is not None
@@ -2461,7 +2474,12 @@ async def _json_response_or_keepalive(
     generator = _with_json_keepalive(http_request, task)
     if lease is not None:
         generator = _release_after_stream(generator, lease)
-    return StreamingResponse(generator, media_type=media_type, headers=headers)
+    return StreamingResponse(
+        generator,
+        media_type=media_type,
+        headers=headers,
+        background=BackgroundTask(lease.release) if lease is not None else None,
+    )
 
 
 @app.get("/health")
@@ -3360,8 +3378,13 @@ async def create_completion(
         # the client is using on its side.
         upstream_request_id = http_request.headers.get("x-request-id")
         await _raise_if_llm_lease_abort_requested(lease)
+        admission_reservations: list[AdmissionReservation | None] = []
         for prompt in prompts:
-            await engine.preflight_completion(prompt, request_id=upstream_request_id)
+            reservation = await engine.preflight_completion(
+                prompt, request_id=upstream_request_id
+            )
+            lease.hold_admission(reservation)
+            admission_reservations.append(reservation)
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -3380,6 +3403,11 @@ async def create_completion(
                             prompt_token_ids=prompt_token_ids_by_prompt[0],
                             resolved_model=resolved_model,
                             response_id=response_id,
+                            admission_reservation_id=(
+                                admission_reservations[0].reservation_id
+                                if admission_reservations[0] is not None
+                                else None
+                            ),
                         ),
                         http_request=http_request,
                         keepalive_chunk=keepalive,
@@ -3388,6 +3416,7 @@ async def create_completion(
                 ),
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                background=BackgroundTask(lease.release),
             )
 
         # Non-streaming response with keepalive during prefill
@@ -3455,6 +3484,11 @@ async def create_completion(
                     xtc_threshold=xtc_threshold,
                     stop=request.stop,
                     seed=request.seed,
+                    admission_reservation_id=(
+                        admission_reservations[i].reservation_id
+                        if admission_reservations[i] is not None
+                        else None
+                    ),
                     **gen_kwargs,
                 )
                 if i == 0:
@@ -3891,11 +3925,16 @@ async def create_chat_completion(
         # an incomplete chunked read. Running the check here lets
         # prefill_memory_exceeded_handler return a clean HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        admission_reservation = await engine.preflight_chat(
             messages,
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+        lease.hold_admission(admission_reservation)
+        if admission_reservation is not None:
+            chat_kwargs["admission_reservation_id"] = (
+                admission_reservation.reservation_id
+            )
 
         await _raise_if_llm_lease_abort_requested(lease)
 
@@ -3928,6 +3967,7 @@ async def create_chat_completion(
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,
+                background=BackgroundTask(lease.release),
             )
 
         # Non-streaming response with keepalive during prefill
@@ -4477,6 +4517,7 @@ async def stream_completion(
     prompt_token_ids: list[int] | None = None,
     resolved_model: str | None = None,
     response_id: str | None = None,
+    admission_reservation_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4540,6 +4581,7 @@ async def stream_completion(
             xtc_threshold=xtc_threshold,
             stop=request.stop,
             seed=request.seed,
+            admission_reservation_id=admission_reservation_id,
             **gen_kwargs,
         ):
             if first_token_time is None and output.new_text:
@@ -5840,11 +5882,16 @@ async def create_anthropic_message(
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        admission_reservation = await engine.preflight_chat(
             messages,
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+        lease.hold_admission(admission_reservation)
+        if admission_reservation is not None:
+            chat_kwargs["admission_reservation_id"] = (
+                admission_reservation.reservation_id
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -5865,6 +5912,7 @@ async def create_anthropic_message(
                 ),
                 media_type="text/event-stream",
                 headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+                background=BackgroundTask(lease.release),
             )
 
         # Non-streaming response with keepalive during prefill
@@ -6352,11 +6400,16 @@ async def create_response(
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
         await _raise_if_llm_lease_abort_requested(lease)
-        await engine.preflight_chat(
+        admission_reservation = await engine.preflight_chat(
             messages,
             request_id=http_request.headers.get("x-request-id"),
             **chat_kwargs,
         )
+        lease.hold_admission(admission_reservation)
+        if admission_reservation is not None:
+            chat_kwargs["admission_reservation_id"] = (
+                admission_reservation.reservation_id
+            )
         await _raise_if_llm_lease_abort_requested(lease)
 
         if request.stream:
@@ -6385,6 +6438,7 @@ async def create_response(
                 ),
                 media_type="text/event-stream",
                 headers=sse_headers,
+                background=BackgroundTask(lease.release),
             )
 
         # Non-streaming with keepalive during prefill

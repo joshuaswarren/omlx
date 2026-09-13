@@ -64,6 +64,40 @@ def _warn_scheduler_unreachable_once(
     )
 
 
+@dataclass(frozen=True)
+class AdmissionReservation:
+    scheduler: Any
+    reservation_id: str
+
+    def release(self) -> None:
+        self.scheduler.release_request_admission(self.reservation_id)
+
+
+async def _reserve_scheduler_admission(
+    scheduler: Any, executor: Any | None = None
+) -> AdmissionReservation:
+    if executor is None:
+        reservation_id = scheduler.reserve_request_admission()
+    else:
+        loop = asyncio.get_running_loop()
+        submission = loop.run_in_executor(executor, scheduler.reserve_request_admission)
+        try:
+            reservation_id = await asyncio.shield(submission)
+        except BaseException:
+            def release_after_reservation(future) -> None:
+                if future.cancelled():
+                    return
+                try:
+                    completed_reservation_id = future.result()
+                except BaseException:
+                    return
+                scheduler.release_request_admission(completed_reservation_id)
+
+            submission.add_done_callback(release_after_reservation)
+            raise
+    return AdmissionReservation(scheduler, reservation_id)
+
+
 async def _run_scheduler_preflight_with_cleanup_retry(
     scheduler: Any,
     *,
@@ -71,7 +105,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
-) -> None:
+) -> AdmissionReservation:
     """Run route preflight after transient post-request cleanup settles.
 
     A finished request can remain resident while its asynchronous cache store
@@ -97,7 +131,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 num_prompt_tokens=num_prompt_tokens,
                 request_id=request_id,
             )
-            return
+            return await _reserve_scheduler_admission(scheduler, executor)
 
         cleanup_pending_fn = getattr(
             scheduler, "has_pending_route_preflight_cleanup", None
@@ -151,7 +185,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
         )
-        return
+        return await _reserve_scheduler_admission(scheduler, executor)
 
 
 @dataclass
@@ -415,7 +449,7 @@ class BaseEngine(ABC):
         tools: Optional[list] = None,
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Optional prefill-memory preflight check for chat requests.
 
         Default no-op; engines that implement the prefill memory guard
@@ -431,7 +465,7 @@ class BaseEngine(ABC):
         prompt: str,
         request_id: Optional[str] = None,
         **kwargs,
-    ) -> None:
+    ) -> AdmissionReservation | None:
         """Optional prefill-memory preflight check for completion requests.
 
         See :meth:`preflight_chat` for the rationale.

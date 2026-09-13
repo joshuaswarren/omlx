@@ -548,6 +548,7 @@ class EngineCore:
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        admission_reservation_id: str | None = None,
     ) -> str:
         """
         Add a request for processing.
@@ -625,26 +626,25 @@ class EngineCore:
         # asyncio.Event per refused request. Re-raise after cleanup so
         # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
+        add_args = (request,)
+        if admission_reservation_id is not None:
+            add_args += (admission_reservation_id,)
+        submission = loop.run_in_executor(
+            self._mlx_executor, self.scheduler.add_request, *add_args
+        )
         try:
-            await loop.run_in_executor(
-                self._mlx_executor, self.scheduler.add_request, request
-            )
+            await asyncio.shield(submission)
         except BaseException:
-            # If the caller is cancelled here (e.g. the client disconnected
-            # before the SSE stream began) — or the insert fails — the request
-            # never reaches stream_outputs()/generate()'s try/finally, so
-            # nothing would mark it finished or clean it up. The collector
-            # created above would then linger forever as a phantom the reaper
-            # cannot see (it was never stamped _finished_at), and the dashboard
-            # would show it as "Generating" indefinitely (#1154).
-            # Drop the tracking and abort any partial scheduler insert (the
-            # deferred abort is idempotent and harmless if it never landed).
-            try:
-                self.scheduler.abort_request(request_id)
-            except Exception as abort_exc:  # noqa: BLE001
-                logger.debug(
-                    f"Abort of partial insert for {request_id} failed: {abort_exc}"
-                )
+            def abort_after_submission(_future) -> None:
+                try:
+                    self.scheduler.abort_request(request_id)
+                except Exception as abort_exc:  # noqa: BLE001
+                    logger.debug(
+                        f"Abort of partial insert for {request_id} failed: {abort_exc}"
+                    )
+                self._wake_engine_loop()
+
+            submission.add_done_callback(abort_after_submission)
             self._cleanup_request(request_id)
             raise
         self._wake_engine_loop()
@@ -1053,17 +1053,21 @@ class EngineCore:
         if sampling_params is None:
             sampling_params = SamplingParams()
 
-        # Add all requests to scheduler
         request_ids = []
-        for prompt in prompts:
-            request_id = str(uuid_module.uuid4())
-            request = Request(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=sampling_params,
-            )
-            self.scheduler.add_request(request)
-            request_ids.append(request_id)
+        try:
+            for prompt in prompts:
+                request_id = str(uuid_module.uuid4())
+                request = Request(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params=sampling_params,
+                )
+                self.scheduler.add_request(request)
+                request_ids.append(request_id)
+        except BaseException:
+            for admitted_request_id in reversed(request_ids):
+                self.scheduler._do_abort_request(admitted_request_id)
+            raise
 
         # Process until all done - direct scheduler access, no async overhead
         results: Dict[str, RequestOutput] = {}

@@ -280,6 +280,7 @@ class SchedulerSettings:
     """Scheduler configuration settings."""
 
     max_concurrent_requests: int = 8
+    max_waiting_requests: int | None = None
     embedding_batch_size: int = 32
     # When True, long prefills are interleaved with decode steps.
     # Reduces TTFT for concurrent requests at the cost of per-step overhead.
@@ -317,6 +318,7 @@ class SchedulerSettings:
             prefill_priority = "context"
         return cls(
             max_concurrent_requests=value,
+            max_waiting_requests=data.get("max_waiting_requests"),
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
@@ -1116,6 +1118,12 @@ class GlobalSettings:
                 logger.warning(
                     f"Invalid OMLX_MAX_CONCURRENT_REQUESTS value: {max_concurrent}"
                 )
+        max_waiting = os.getenv("OMLX_MAX_WAITING_REQUESTS")
+        if max_waiting is not None:
+            try:
+                self.scheduler.max_waiting_requests = int(max_waiting)
+            except ValueError:
+                logger.warning(f"Invalid OMLX_MAX_WAITING_REQUESTS value: {max_waiting}")
         if embedding_batch_size := os.getenv("OMLX_EMBEDDING_BATCH_SIZE"):
             try:
                 self.scheduler.embedding_batch_size = int(embedding_batch_size)
@@ -1253,6 +1261,11 @@ class GlobalSettings:
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
+        if (
+            hasattr(args, "max_waiting_requests")
+            and args.max_waiting_requests is not None
+        ):
+            self.scheduler.max_waiting_requests = args.max_waiting_requests
         if (
             hasattr(args, "embedding_batch_size")
             and args.embedding_batch_size is not None
@@ -1545,6 +1558,14 @@ class GlobalSettings:
                 f"Invalid max_concurrent_requests: "
                 f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
+        if (
+            self.scheduler.max_waiting_requests is not None
+            and self.scheduler.max_waiting_requests < 0
+        ):
+            errors.append(
+                f"Invalid max_waiting_requests: "
+                f"{self.scheduler.max_waiting_requests} (must be >= 0)"
+            )
         if self.scheduler.embedding_batch_size <= 0:
             errors.append(
                 f"Invalid embedding_batch_size: "
@@ -1709,6 +1730,7 @@ class GlobalSettings:
 
         return SchedulerConfig(
             max_num_seqs=self.scheduler.max_concurrent_requests,
+            max_waiting_requests=self.scheduler.max_waiting_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,

@@ -42,6 +42,16 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be an integer greater than or equal to 0")
+    return parsed
+
+
 def _has_cli_overrides(args) -> bool:
     """Check if CLI args contain non-default values that should be saved.
 
@@ -56,6 +66,7 @@ def _has_cli_overrides(args) -> bool:
         "sse_keepalive_mode",
         "max_audio_upload_size",
         "max_concurrent_requests",
+        "max_waiting_requests",
         "embedding_batch_size",
         "memory_guard",
         "memory_guard_gb",
@@ -1087,6 +1098,15 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+    serve_parser.add_argument(
+        "--max-waiting-requests",
+        type=_nonnegative_int,
+        default=None,
+        help=(
+            "Max requests queued beyond active execution slots. 0 rejects while "
+            "all slots are busy. Unset preserves the legacy queue cap."
+        ),
     )
     serve_parser.add_argument(
         "--embedding-batch-size",

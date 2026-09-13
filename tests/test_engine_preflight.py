@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from omlx.exceptions import PrefillMemoryExceededError
+from omlx.exceptions import PrefillMemoryExceededError, SchedulerQueueFullError
 from omlx.scheduler import Scheduler
 
 _TINY_PNG_DATA_URI = (
@@ -899,3 +899,52 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "memory_guard_tier" in rej.message
         assert "iogpu.wired_limit_mb" not in rej.message
         assert "custom_ceiling_bytes" not in rej.message
+
+
+@pytest.mark.asyncio
+async def test_dflash_primary_reservation_blocks_fallback_mode_switch():
+    import asyncio
+    import threading
+
+    from omlx.engine.dflash import DFlashEngine
+
+    engine = DFlashEngine.__new__(DFlashEngine)
+    engine._loaded = True
+    engine._in_fallback_mode = False
+    engine._fallback_engine = None
+    engine._fallback_engine_type = "batched"
+    engine._fallback_lock = asyncio.Lock()
+    engine._primary_admission_lock = threading.Lock()
+    engine._primary_admission_ids = set()
+    engine._scheduler_config = SimpleNamespace(
+        max_num_seqs=1, max_waiting_requests=0
+    )
+    engine._max_dflash_ctx = 2
+    engine._prefill_guard = MagicMock()
+    engine._tokenizer_obj = MagicMock()
+    engine._tokenizer_obj.encode.side_effect = lambda prompt: (
+        [1, 2] if prompt == "long" else [1]
+    )
+    fallback = MagicMock()
+    fallback.preflight_completion = AsyncMock(return_value="fallback-reservation")
+
+    async def switch_to_fallback():
+        engine._fallback_engine = fallback
+        engine._in_fallback_mode = True
+
+    engine._evict_dflash_and_start_fallback = AsyncMock(
+        side_effect=switch_to_fallback
+    )
+
+    primary = await engine.preflight_completion("short")
+    with pytest.raises(SchedulerQueueFullError):
+        await engine.preflight_completion("long")
+
+    assert engine._in_fallback_mode is False
+    engine._evict_dflash_and_start_fallback.assert_not_awaited()
+
+    primary.release()
+    result = await engine.preflight_completion("long")
+
+    assert result == "fallback-reservation"
+    engine._evict_dflash_and_start_fallback.assert_awaited_once()
