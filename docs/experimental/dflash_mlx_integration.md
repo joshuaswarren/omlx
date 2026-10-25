@@ -69,7 +69,7 @@ A DFlash request fails soft: a declined or failed drafter leaves the model's nat
 | Field | Type | Meaning |
 |-------|------|---------|
 | `engine_type` | str | Configured engine for the model (unchanged) |
-| `effective_engine` | str \| null | Engine serving the model now: `batched`, `vlm`, `distributed`, `splash`, `embedding`, `reranker`, `audio_stt`, `audio_tts`, `audio_sts`. `null` when not loaded |
+| `effective_engine` | str \| null | Engine serving the model now: `batched`, `vlm`, `distributed`, `splash`, `decision`, `embedding`, `reranker`, `audio_stt`, `audio_tts`, `audio_sts`. `null` when not loaded |
 | `dflash_requested` | bool | `dflash_enabled` was set for this load |
 | `dflash_active` | bool | The batched DFlash drafter is loaded and serving |
 | `dflash_fallback_reason` | str \| null | Why a requested DFlash load is not active. Bounded and path-redacted, truncated to 200 characters |
