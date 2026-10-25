@@ -4060,6 +4060,10 @@ class EnginePool:
                 entry.dflash_fallback_reason = (
                     "DFlash is not supported with an external engine"
                 )
+            elif dflash_enabled and effective_type == "decision":
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported for decision models"
+                )
             if (
                 engine is None
                 and deployment is None

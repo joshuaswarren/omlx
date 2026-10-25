@@ -160,6 +160,20 @@ class TestDFlashRequestedButFellBack:
             "DFlash is not supported for this model type and engine"
         )
 
+    @pytest.mark.asyncio
+    async def test_decision_model_reports_declined_dflash(self, model_dir):
+        pool = _make_pool(model_dir)
+        pool.get_entry("model-a").engine_type = "decision"
+        with patch("omlx.engine_pool.DecisionEngine", return_value=_batched_engine()):
+            await pool._load_engine("model-a", runtime_settings=_dflash_settings())
+        status = _status_for(pool, "model-a")
+        assert status["effective_engine"] == "decision"
+        assert status["dflash_requested"] is True
+        assert status["dflash_active"] is False
+        assert status["dflash_fallback_reason"] == (
+            "DFlash is not supported for decision models"
+        )
+
 
 class TestDFlashNotRequested:
     @pytest.mark.asyncio
