@@ -232,6 +232,7 @@
 - [@youvegotmoxie](https://github.com/youvegotmoxie)
 - [@ysys143](https://github.com/ysys143)
 - [@zwcf5200](https://github.com/zwcf5200)
+
 _Linked GitHub accounts only. Anonymous (unlinked) commit authors are
 enumerable through the API (anon=true) but are identified there only by
 name/email, which this registry does not publish; credit them by hand in
