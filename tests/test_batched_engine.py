@@ -1321,6 +1321,7 @@ class TestBatchedEnginePreparedPrompt:
             engine._engine.engine.scheduler,
             num_prompt_tokens=3,
             request_id="prepared-request",
+            token_ids=prepared[1],
         )
         engine._tokenizer.apply_chat_template.assert_called_once()
         rendered_options = engine._tokenizer.apply_chat_template.call_args.kwargs

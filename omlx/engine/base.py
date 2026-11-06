@@ -84,6 +84,20 @@ def _warn_scheduler_unreachable_once(
     )
 
 
+def _probed_cached_prefix_tokens(
+    scheduler: Any, token_ids: list[int] | None
+) -> int | None:
+    """Cached prefix tokens for route preflight, or None when unknown.
+
+    None keeps the conservative bound that charges the whole prompt KV.
+    """
+    probe = getattr(scheduler, "count_cached_prefix_tokens", None)
+    if token_ids is None or not callable(probe):
+        return None
+    return int(probe(token_ids))
+
+
+
 async def _run_scheduler_preflight_with_cleanup_retry(
     scheduler: Any,
     *,
@@ -91,6 +105,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     request_id: str | None,
     eviction_callback: Any | None,
     executor: Any | None = None,
+    token_ids: list[int] | None = None,
 ) -> None:
     """Run route preflight after transient post-request cleanup settles.
 
@@ -108,13 +123,16 @@ async def _run_scheduler_preflight_with_cleanup_retry(
     waited_for_cleanup = False
 
     while True:
+        cached_tokens = _probed_cached_prefix_tokens(scheduler, token_ids)
         eviction_request = scheduler.preflight_eviction_request(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=cached_tokens,
             request_id=request_id,
         )
         if eviction_request is None:
             scheduler.preflight_or_raise(
                 num_prompt_tokens=num_prompt_tokens,
+                cached_tokens=cached_tokens,
                 request_id=request_id,
             )
             return
@@ -190,6 +208,7 @@ async def _run_scheduler_preflight_with_cleanup_retry(
                 await loop.run_in_executor(executor, refresh_usage)
         scheduler.preflight_or_raise(
             num_prompt_tokens=num_prompt_tokens,
+            cached_tokens=_probed_cached_prefix_tokens(scheduler, token_ids),
             request_id=request_id,
         )
         return
