@@ -5118,12 +5118,44 @@ class Scheduler:
             ratios.append(watermark / hard_limit)
         return max(0.0, min(1.0, *ratios))
 
+    def count_cached_prefix_tokens(self, token_ids: list[int]) -> int:
+        """Full-block prefix tokens already cached, read-only (#4561).
+
+        Route preflight prices a request before admission and must not claim
+        blocks, so this never allocates or registers a block.
+        """
+        if self.paged_cache_manager is None:
+            return 0
+        return self.paged_cache_manager.count_cached_prefix_tokens(token_ids)
+
+    def _protected_prefix_bytes(
+        self,
+        *,
+        num_prompt_tokens: int,
+        cached_tokens: int | None,
+        est: _AdmissionEstimate,
+    ) -> int:
+        """KV bytes of the cached prefix the hot cache must keep.
+        ``None`` means the prefix is unknown, so the whole prompt KV is charged,
+        as before the probe existed.
+        """
+        if cached_tokens is None:
+            return est.kv_exact
+        if cached_tokens <= 0:
+            return 0
+        prefix = self._admission_estimate(
+            num_prompt_tokens=min(cached_tokens, num_prompt_tokens),
+            cached_tokens=0,
+            current=0,
+        )
+        return est.kv_exact if prefix is None else prefix.kv_exact
+
     def _releasable_hot_cache_credit(self, own_prefix_bytes: int) -> int:
         """Limit the hot cache gives back once a request is admitted.
 
-        Route preflight cannot protect the request's prefix blocks yet, so it
-        counts this instead of releasing hot cache. ``own_prefix_bytes``
-        bounds the request's own cached prefix, which stays protected.
+        Route preflight charges this in place of releasing hot cache, so it
+        must not count the request's own cached prefix as releasable.
+        ``own_prefix_bytes`` is that prefix's KV, which stays held.
         """
         reserved = self._memory_hot_cache_reserved_bytes
         if reserved <= 0:
@@ -12873,7 +12905,7 @@ class Scheduler:
         self,
         *,
         num_prompt_tokens: int,
-        cached_tokens: int,
+        cached_tokens: int | None,
         current: int,
     ) -> _AdmissionEstimate | None:
         """Deterministic admission estimate shared by every preflight path.
@@ -12908,7 +12940,7 @@ class Scheduler:
         monitor = self.memory_monitor
         if monitor is None:
             return None
-        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens), 0), 0)
+        new_tokens = max(int(num_prompt_tokens) - max(int(cached_tokens or 0), 0), 0)
         if new_tokens == 0:
             return None
         # External prefill evaluates prompt[0:N-1]; the final token is left
@@ -13004,7 +13036,7 @@ class Scheduler:
         self,
         *,
         num_prompt_tokens: int,
-        cached_tokens: int = 0,
+        cached_tokens: int | None = None,
         request_id: str | None = None,
     ) -> None:
         """Pre-StreamingResponse prefill memory check.
@@ -13040,7 +13072,13 @@ class Scheduler:
 
             request_id = f"preflight-{_uuid.uuid4().hex[:8]}"
 
-        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
+        hot_cache_credit = self._releasable_hot_cache_credit(
+            self._protected_prefix_bytes(
+                num_prompt_tokens=num_prompt_tokens,
+                cached_tokens=cached_tokens,
+                est=est,
+            )
+        )
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             message = self._format_rejection_message(
@@ -13053,7 +13091,7 @@ class Scheduler:
             logger.warning(
                 "Preflight rejected (%d tokens, cached=%d, request_id=%s): %s",
                 num_prompt_tokens,
-                cached_tokens,
+                cached_tokens or 0,
                 request_id,
                 message,
             )
@@ -13076,7 +13114,7 @@ class Scheduler:
             "Preflight safety-cap rejected (%d tokens, cached=%d, "
             "request_id=%s): %s",
             num_prompt_tokens,
-            cached_tokens,
+            cached_tokens or 0,
             request_id,
             safety_rejection.message,
         )
@@ -13091,7 +13129,7 @@ class Scheduler:
         self,
         *,
         num_prompt_tokens: int,
-        cached_tokens: int = 0,
+        cached_tokens: int | None = None,
         request_id: str | None = None,
     ) -> PrefillEvictionRequest | None:
         """Return an idle-model eviction request for route-level preflight.
@@ -13122,7 +13160,13 @@ class Scheduler:
             return None
 
         # Evict models only for what the hot cache cannot give back.
-        hot_cache_credit = self._releasable_hot_cache_credit(est.kv_exact)
+        hot_cache_credit = self._releasable_hot_cache_credit(
+            self._protected_prefix_bytes(
+                num_prompt_tokens=num_prompt_tokens,
+                cached_tokens=cached_tokens,
+                est=est,
+            )
+        )
         admission_limit = self._admission_limit_bytes()
         if est.estimated - hot_cache_credit > admission_limit:
             return PrefillEvictionRequest(

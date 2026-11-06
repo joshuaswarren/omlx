@@ -134,6 +134,47 @@ class TestPreflightOrRaise:
         with pytest.raises(PrefillMemoryExceededError):
             scheduler.preflight_or_raise(num_prompt_tokens=65536, request_id="r")
 
+    def test_cached_prefix_protects_its_kv_not_the_full_prompt(self, monkeypatch):
+        """Route preflight protects the cached prefix's KV, not the prompt's (#4561).
+
+        A prompt with 8192 cached tokens must not charge the other 57344
+        uncached tokens as protected prefix, or the hot-cache credit collapses
+        and a request that fits gets rejected.
+        """
+        gb = 1024**3
+        prompt, cached = 65536, 8192
+        scheduler = _make_scheduler()
+        scheduler._prefill_memory_guard = True
+        scheduler._memory_abort_limit_bytes = 10**18
+        scheduler._memory_hot_cache_reserved_bytes = 100 * gb
+
+        import omlx.scheduler as scheduler_mod
+
+        monkeypatch.setattr(scheduler_mod.mx, "get_active_memory", lambda: 0)
+        monkeypatch.setattr(scheduler_mod, "get_phys_footprint", lambda: 0)
+        prefix_kv = scheduler._admission_estimate(
+            num_prompt_tokens=cached, cached_tokens=0, current=0
+        ).kv_exact
+        monkeypatch.setattr(
+            scheduler, "_hot_cache_cpu_bytes", lambda: prefix_kv + 2 * gb
+        )
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=prompt, cached_tokens=cached, current=0
+        )
+        scheduler._memory_hard_limit_bytes = int(
+            1.1 * (est.estimated - scheduler._releasable_hot_cache_credit(prefix_kv))
+        )
+
+        scheduler.preflight_or_raise(
+            num_prompt_tokens=prompt, cached_tokens=cached, request_id="r"
+        )
+        assert (
+            scheduler.preflight_eviction_request(
+                num_prompt_tokens=prompt, cached_tokens=cached
+            )
+            is None
+        )
+
     def test_skips_when_guard_disabled(self):
         scheduler = _make_scheduler()
         scheduler._prefill_memory_guard = False
@@ -220,10 +261,12 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
 
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=None,
         request_id="req-evict",
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
+        cached_tokens=None,
         request_id="req-evict",
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
@@ -268,6 +311,7 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     assert scheduler.has_pending_route_preflight_cleanup.call_count == 2
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
+        cached_tokens=None,
         request_id="req-next",
     )
     evict.assert_not_awaited()
@@ -326,6 +370,7 @@ async def test_stale_idle_preflight_refreshes_before_eviction():
     scheduler.refresh_route_preflight_usage.assert_called_once_with()
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
+        cached_tokens=None,
         request_id="req-stale",
     )
     evict.assert_not_awaited()
@@ -1132,3 +1177,28 @@ class TestRejectionMessageNamesBindingCeiling:
         assert "memory_guard_tier" in rej.message
         assert "iogpu.wired_limit_mb" not in rej.message
         assert "custom_ceiling_bytes" not in rej.message
+
+
+async def test_cleanup_retry_forwards_probed_cached_prefix_to_preflight():
+    """Route preflight must price the cached prefix the probe found (#4561)."""
+    calls: list[tuple[str, int | None]] = []
+
+    class _Scheduler:
+        def count_cached_prefix_tokens(self, token_ids):
+            return 8192
+
+        def preflight_eviction_request(self, *, num_prompt_tokens, cached_tokens=None, request_id=None):
+            calls.append(("evict", cached_tokens))
+            return None
+
+        def preflight_or_raise(self, *, num_prompt_tokens, cached_tokens=None, request_id=None):
+            calls.append(("raise", cached_tokens))
+
+    await _run_scheduler_preflight_with_cleanup_retry(
+        _Scheduler(),
+        num_prompt_tokens=65536,
+        request_id="probe-thread",
+        eviction_callback=None,
+        token_ids=list(range(65536)),
+    )
+    assert calls == [("evict", 8192), ("raise", 8192)]

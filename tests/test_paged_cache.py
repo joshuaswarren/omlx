@@ -941,6 +941,29 @@ class TestPagedCacheManager:
         assert num_tokens == 4
         assert len(cached_blocks) == 1
 
+    def test_count_cached_prefix_tokens_is_read_only(self):
+        """Route preflight probes the prefix without claiming blocks (#4561)."""
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        hash1 = compute_block_hash(None, [1, 2, 3, 4], model_name="test-model")
+        hash2 = compute_block_hash(hash1, [5, 6, 7, 8], model_name="test-model")
+
+        mock_ssd = MagicMock(spec=[])
+        mock_ssd.has_block = MagicMock(side_effect=lambda h: h in (hash1, hash2))
+        manager._paged_ssd_cache_manager = mock_ssd
+        free_before = manager.free_block_queue.num_free_blocks
+        stats_before = (manager.stats.hits, manager.stats.misses)
+
+        assert manager.count_cached_prefix_tokens(tokens) == 8
+
+        assert manager.cached_block_hash_to_block.get_block(hash1) is None
+        assert manager.cached_block_hash_to_block.get_block(hash2) is None
+        assert manager.free_block_queue.num_free_blocks == free_before
+        assert (manager.stats.hits, manager.stats.misses) == stats_before
+
     def test_get_computed_blocks_ssd_fallback_no_free_blocks(self):
         """SSD fallback should not raise when no free blocks are available."""
         manager = PagedCacheManager(

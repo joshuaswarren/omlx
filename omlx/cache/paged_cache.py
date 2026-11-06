@@ -1082,6 +1082,48 @@ class PagedCacheManager(CacheManager):
 
             return cached_blocks, num_cached_tokens
 
+    def count_cached_prefix_tokens(
+        self,
+        token_ids: List[int],
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+    ) -> int:
+        """Count full-block cached prefix tokens without claiming any block.
+
+        Route preflight prices a request before admission. Unlike
+        get_computed_blocks, this walks the same hash chain read-only: it
+        allocates nothing, registers nothing, and leaves stats untouched.
+        Tail blocks are not counted, so the result is a lower bound.
+        """
+        if not self.enable_caching:
+            return 0
+        num_cached_tokens = 0
+        parent_hash = None
+        with self._lock:
+            for start in range(0, len(token_ids) - self.block_size + 1, self.block_size):
+                end = start + self.block_size
+                block_hash = compute_block_hash(
+                    parent_hash,
+                    token_ids[start:end],
+                    extra_keys=resolve_block_extra_keys(
+                        end,
+                        extra_keys=extra_keys,
+                        extra_key_token_start=extra_key_token_start,
+                        extra_key_ranges=extra_key_ranges,
+                    ),
+                    model_name=self.model_name,
+                )
+                on_ssd = (
+                    self._paged_ssd_cache_manager is not None
+                    and self._paged_ssd_cache_manager.has_block(block_hash)
+                )
+                if self.cached_block_hash_to_block.get_block(block_hash) is None and not on_ssd:
+                    break
+                parent_hash = block_hash
+                num_cached_tokens += self.block_size
+        return num_cached_tokens
+
     # =========================================================================
     # Legacy hash methods (for backwards compatibility)
     # =========================================================================
