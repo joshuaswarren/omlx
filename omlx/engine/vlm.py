@@ -59,6 +59,7 @@ from ..model_settings import (
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.gemma4_untied_lm_head import apply_gemma4_untied_lm_head_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -2013,6 +2014,7 @@ class VLMBatchedEngine(BaseEngine):
             _patch_video_processor_bug()
             apply_pixtral_torch_free_patch()
             apply_gemma4_audio_patch()
+            apply_gemma4_untied_lm_head_patch()
             with (
                 _strip_audio_config_if_orphaned(Path(self._model_name)),
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
