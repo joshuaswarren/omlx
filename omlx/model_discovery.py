@@ -208,6 +208,7 @@ VLM_ARCHITECTURES = {
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
+    "RadioMBartPrefixForCausalLM",  # nvidia Nemotron 3.5 Parse (no vision_config)
 }
 
 # Known embedding model types from mlx-embeddings

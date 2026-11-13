@@ -368,6 +368,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_detect_nemotron_parse_without_vision_config_as_vlm(self, tmp_path):
+        """Nemotron 3.5 Parse keeps its vision tower outside any vision_config."""
+        config = {
+            "model_type": "nemotron_parse_v3_5",
+            "architectures": ["RadioMBartPrefixForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_diffusion_gemma_as_vlm(self, tmp_path):
         """DiffusionGemma is served by mlx-vlm even without vision_config."""
         config = {
