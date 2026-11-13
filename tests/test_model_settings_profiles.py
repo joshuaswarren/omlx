@@ -993,6 +993,31 @@ def test_startup_repairs_only_missing_references_with_exact_backups(tmp_path):
         ) == snapshot
 
 
+def test_startup_repairs_references_when_settings_file_is_version_1(tmp_path):
+    expected = _write_legacy_profile_storage(tmp_path)
+    settings = json.loads((tmp_path / "model_settings.json").read_bytes())
+    settings["version"] = 1  # written by 0.7.x, which the loader still accepts
+    (tmp_path / "model_settings.json").write_text(json.dumps(settings))
+    ModelSettingsManager(tmp_path)
+    repaired = json.loads((tmp_path / "model_settings.json").read_bytes())
+    assert repaired["models"]["m"]["active_profile_name"] is None
+    assert repaired["version"] == 1
+    profiles = json.loads((tmp_path / "model_profiles.json").read_bytes())
+    assert profiles["profiles"]["m"]["orphan"]["source_template"] is None
+    assert len(list(tmp_path.glob("profile-reference-backup-*"))) == 1
+
+
+def test_startup_skips_repair_when_settings_file_is_newer_than_supported(tmp_path):
+    _write_legacy_profile_storage(tmp_path)
+    settings = json.loads((tmp_path / "model_settings.json").read_bytes())
+    settings["version"] = 99
+    (tmp_path / "model_settings.json").write_text(json.dumps(settings))
+    before = (tmp_path / "model_settings.json").read_bytes()
+    ModelSettingsManager(tmp_path)
+    assert (tmp_path / "model_settings.json").read_bytes() == before
+    assert list(tmp_path.glob("profile-reference-backup-*")) == []
+
+
 def test_fresh_storage_does_not_create_repair_files(tmp_path):
     ModelSettingsManager(tmp_path)
     assert list(tmp_path.iterdir()) == []
