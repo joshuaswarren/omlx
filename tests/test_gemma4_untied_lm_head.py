@@ -94,3 +94,43 @@ def test_tied_model_has_no_lm_head_and_ignores_it():
     assert mx.allclose(
         model.language_model.logits_from_hidden(hidden), expected, atol=1e-4
     )
+
+
+async def test_engine_start_applies_the_patch(tmp_path, monkeypatch):
+    import mlx_vlm.utils as vlm_utils
+    from mlx_vlm.models.gemma4 import language
+
+    from omlx.engine import vlm as vlm_module
+    from omlx.patches import gemma4_untied_lm_head
+    from omlx.utils import model_loading
+
+    class LoadReachedError(Exception):
+        pass
+
+    def unpatched_init(self, config, *args, **kwargs):
+        raise AssertionError("never called")
+
+    def unpatched_logits(self, hidden):
+        raise AssertionError("never called")
+
+    def stop_at_load(model_path, **kwargs):
+        raise LoadReachedError
+
+    monkeypatch.setattr(gemma4_untied_lm_head, "_PATCHED", False)
+    monkeypatch.setattr(gemma4.Model, "__init__", unpatched_init)
+    monkeypatch.setattr(language.LanguageModel, "logits_from_hidden", unpatched_logits)
+    monkeypatch.setattr(vlm_utils, "load", stop_at_load)
+    monkeypatch.setattr(
+        model_loading, "maybe_apply_pre_load_patches", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(
+        model_loading, "maybe_load_custom_quantization", lambda *a, **kw: None
+    )
+    (tmp_path / "config.json").write_text('{"model_type": "gemma4"}')
+
+    engine = vlm_module.VLMBatchedEngine(model_name=str(tmp_path))
+    with pytest.raises(LoadReachedError):
+        await engine.start()
+
+    assert gemma4.Model.__init__ is not unpatched_init
+    assert language.LanguageModel.logits_from_hidden is not unpatched_logits
