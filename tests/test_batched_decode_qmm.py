@@ -54,12 +54,13 @@ def _routes_taken(monkeypatch, linear, x):
     return taken, linear(x)
 
 
+@pytest.mark.parametrize("bits", [4, 6, 8])
 @pytest.mark.parametrize("rows,route", [(2, "m1"), (3, "m1"), (4, "m1"), (5, "m1_mma")])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_few_decode_rows_take_the_m1_kernels(
-    monkeypatch, m1_batched_decode, rows, route, dtype
+    monkeypatch, m1_batched_decode, rows, route, dtype, bits
 ):
-    linear = _linear(4, dtype)
+    linear = _linear(bits, dtype)
     x = mx.random.normal((rows, 1, K)).astype(dtype)
     stock = mx.quantized_matmul(
         x.reshape(rows, K),
@@ -68,7 +69,7 @@ def test_few_decode_rows_take_the_m1_kernels(
         linear.biases,
         transpose=True,
         group_size=64,
-        bits=4,
+        bits=bits,
     ).reshape(rows, 1, N)
 
     taken, routed = _routes_taken(monkeypatch, linear, x)
@@ -102,10 +103,10 @@ def test_small_projections_keep_the_stock_path(m1_batched_decode, rows):
 
 
 def test_other_routes_stay_off_below_six_rows(monkeypatch, m1_batched_decode):
-    # No M1 kernel reads 6-bit weights; sg8 would, from four rows.
-    assert qwen35_verify_qmm._verify_route(4, K, N, 6, 64, mx.float16) == "sg8"
+    # 5-bit weights stop at three rows on the M1 qmv; sg8 would take four.
+    assert qwen35_verify_qmm._verify_route(4, K, N, 5, 64, mx.float16) == "sg8"
     taken, _ = _routes_taken(
-        monkeypatch, _linear(6, mx.float16), mx.ones((4, 1, K), dtype=mx.float16)
+        monkeypatch, _linear(5, mx.float16), mx.ones((4, 1, K), dtype=mx.float16)
     )
     assert taken == []
 
