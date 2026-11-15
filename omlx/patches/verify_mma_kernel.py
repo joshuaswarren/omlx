@@ -11,8 +11,8 @@ Semantics: row j attends keys [0 .. n_keys - T + j] (end-aligned causal);
 the mask argument of the stock call is not needed. Pass 1 splits the keys
 over up to 128 blocks (8-key tiles, strided), pass 2 combines the partials.
 
-Shape contract: queries [B, Hq, T, 128], K/V buffers [B, Hkv, cap, 128],
-gqa * T <= 32.
+Shape contract: queries [B, Hq, T, D], K/V buffers [B, Hkv, cap, D] with D
+in (128, 256), gqa * T <= 32.
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ import mlx.core as mx
 _MAX_BLOCKS = 128  # most key blocks (pass-1 threadgroups per KV head)
 _TARGET_GROUPS = 256  # threadgroups per dispatch: layers run back to back, so a
 # small grid leaves the GPU idle (measured: 32 blocks x 8 KV heads beat 16 and 64)
-_HEAD_DIM = 128
+_HEAD_DIMS = (128, 256)
+_SPLIT = {128: 1, 256: 2}  # simdgroups per row tile: 256-wide fragments would spill registers
 _MAX_ROWS = 32  # four 8-row tiles, one simdgroup each
 
 _HEADER = """
@@ -40,7 +41,9 @@ constant constexpr float NEG_MAX = -3.402823466e38f;
 _PASS1_SRC = """
     const int BLOCKS = params[3];
     constexpr int D = {head_dim};
+    constexpr int SPLIT = {split};  // simdgroups that share one row tile's width
     constexpr int ND = D / 8;
+    constexpr int NDH = ND / SPLIT;  // 8-wide column groups one simdgroup owns
     constexpr int M = G * TR;
     constexpr int LD = D + 8;  // padded tgmem row: no bank conflicts
 
@@ -50,13 +53,16 @@ _PASS1_SRC = """
 
     threadgroup float ks[8 * LD];
     threadgroup float vs[8 * LD];
+    threadgroup float2 sx[4 * SPLIT * 32];  // partial scores, SPLIT > 1 only
     const uint lane = thread_index_in_simdgroup;
     const int nthreads = threads_per_threadgroup.y * 32;
     const int tid = thread_position_in_threadgroup.y * 32 + lane;
     const int kv = threadgroup_position_in_grid.x;
     const int b = threadgroup_position_in_grid.y;
     const int block = threadgroup_position_in_grid.z;
-    const int rt = thread_position_in_threadgroup.y;
+    const int rt = thread_position_in_threadgroup.y / SPLIT;
+    const int h = thread_position_in_threadgroup.y % SPLIT;
+    const int d0 = h * NDH;  // first column group of this simdgroup
     const int num_kv = threadgroups_per_grid.x;
     const int num_q = num_kv * G;
 
@@ -72,12 +78,12 @@ _PASS1_SRC = """
     const device T* kp = k + (size_t)(b * num_kv + kv) * cap_k * D;
     const device T* vp = v + (size_t)(b * num_kv + kv) * cap_v * D;
 
-    simdgroup_float8x8 qf[ND];
-    simdgroup_float8x8 o[ND];
+    simdgroup_float8x8 qf[NDH];
+    simdgroup_float8x8 o[NDH];
     _Pragma("clang loop unroll(full)")
-    for (int d8 = 0; d8 < ND; d8++) {{
-        qf[d8].thread_elements()[0] = row_ok ? static_cast<float>(qp[d8 * 8 + fn]) : 0.0f;
-        qf[d8].thread_elements()[1] = row_ok ? static_cast<float>(qp[d8 * 8 + fn + 1]) : 0.0f;
+    for (int d8 = 0; d8 < NDH; d8++) {{
+        qf[d8].thread_elements()[0] = row_ok ? static_cast<float>(qp[(d0 + d8) * 8 + fn]) : 0.0f;
+        qf[d8].thread_elements()[1] = row_ok ? static_cast<float>(qp[(d0 + d8) * 8 + fn + 1]) : 0.0f;
         o[d8] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     }}
     float m = NEG_MAX;
@@ -108,10 +114,23 @@ _PASS1_SRC = """
 
         simdgroup_float8x8 s = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         _Pragma("clang loop unroll(full)")
-    for (int d8 = 0; d8 < ND; d8++) {{
+    for (int d8 = 0; d8 < NDH; d8++) {{
             simdgroup_float8x8 kt;
-            simdgroup_load(kt, ks + d8 * 8, LD, ulong2(0, 0), true);
+            simdgroup_load(kt, ks + (d0 + d8) * 8, LD, ulong2(0, 0), true);
             simdgroup_multiply_accumulate(s, qf[d8], kt, s);
+        }}
+        if (SPLIT > 1) {{
+            // Each simdgroup of the row tile summed its own columns; both
+            // add the same two partials, so they continue with equal scores.
+            sx[(rt * SPLIT + h) * 32 + lane] =
+                float2(s.thread_elements()[0], s.thread_elements()[1]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float2 sum2 = 0.0f;
+            for (int j = 0; j < SPLIT; j++) {{
+                sum2 += sx[(rt * SPLIT + j) * 32 + lane];
+            }}
+            s.thread_elements()[0] = sum2.x;
+            s.thread_elements()[1] = sum2.y;
         }}
 
         const bool ok0 = key0 <= horizon;
@@ -132,11 +151,11 @@ _PASS1_SRC = """
         p.thread_elements()[0] = p0;
         p.thread_elements()[1] = p1;
         _Pragma("clang loop unroll(full)")
-    for (int d8 = 0; d8 < ND; d8++) {{
+    for (int d8 = 0; d8 < NDH; d8++) {{
             o[d8].thread_elements()[0] *= factor;
             o[d8].thread_elements()[1] *= factor;
             simdgroup_float8x8 vt;
-            simdgroup_load(vt, vs + d8 * 8, LD);
+            simdgroup_load(vt, vs + (d0 + d8) * 8, LD);
             simdgroup_multiply_accumulate(o[d8], p, vt, o[d8]);
         }}
     }}
@@ -150,11 +169,11 @@ _PASS1_SRC = """
         // of per-block accumulators).
         device float* pp = partials + (o_off * BLOCKS + block) * D;
         _Pragma("clang loop unroll(full)")
-    for (int d8 = 0; d8 < ND; d8++) {{
-            pp[d8 * 8 + fn] = o[d8].thread_elements()[0];
-            pp[d8 * 8 + fn + 1] = o[d8].thread_elements()[1];
+    for (int d8 = 0; d8 < NDH; d8++) {{
+            pp[(d0 + d8) * 8 + fn] = o[d8].thread_elements()[0];
+            pp[(d0 + d8) * 8 + fn + 1] = o[d8].thread_elements()[1];
         }}
-        if (fn == 0) {{
+        if (fn == 0 && h == 0) {{
             sums[o_off * BLOCKS + block] = lt;
             maxs[o_off * BLOCKS + block] = m;
         }}
@@ -187,21 +206,15 @@ _PASS2_SRC = """
     out[(size_t)o_off * D + d] = static_cast<T>(total == 0.0f ? acc : acc / total);
 """
 
-_kernel = None
-_kernel2 = None
-
-
-def _pass1():
-    global _kernel
-    if _kernel is None:
-        _kernel = mx.fast.metal_kernel(
-            name=f"omlx_mma_verify_sdpa_p1_d{_HEAD_DIM}",
-            input_names=["q", "k", "v", "params"],
-            output_names=["partials", "sums", "maxs"],
-            header=_HEADER,
-            source=_PASS1_SRC.format(head_dim=_HEAD_DIM),
-        )
-    return _kernel
+@functools.lru_cache(maxsize=len(_HEAD_DIMS))
+def _pass1(head_dim: int):
+    return mx.fast.metal_kernel(
+        name=f"omlx_mma_verify_sdpa_p1_d{head_dim}",
+        input_names=["q", "k", "v", "params"],
+        output_names=["partials", "sums", "maxs"],
+        header=_HEADER,
+        source=_PASS1_SRC.format(head_dim=head_dim, split=_SPLIT[head_dim]),
+    )
 
 
 @functools.lru_cache(maxsize=16)
@@ -211,43 +224,42 @@ def _params(n_keys: int, cap_k: int, cap_v: int, blocks: int):
     return mx.array([n_keys, cap_k, cap_v, blocks], dtype=mx.int32)
 
 
-def _pass2():
-    global _kernel2
-    if _kernel2 is None:
-        _kernel2 = mx.fast.metal_kernel(
-            name=f"omlx_mma_verify_sdpa_p2_d{_HEAD_DIM}",
-            input_names=["partials", "sums", "maxs", "params"],
-            output_names=["out"],
-            header=_HEADER,
-            source=_PASS2_SRC.format(head_dim=_HEAD_DIM),
-        )
-    return _kernel2
+@functools.lru_cache(maxsize=len(_HEAD_DIMS))
+def _pass2(head_dim: int):
+    return mx.fast.metal_kernel(
+        name=f"omlx_mma_verify_sdpa_p2_d{head_dim}",
+        input_names=["partials", "sums", "maxs", "params"],
+        output_names=["out"],
+        header=_HEADER,
+        source=_PASS2_SRC.format(head_dim=head_dim),
+    )
 
 
 def mma_verify_sdpa(queries, k_buf, v_buf, n_keys: int, scale: float):
     """Multi-row causal SDPA over a linear KV buffer.
 
-    queries [B, Hq, T, 128]; k_buf/v_buf [B, Hkv, capacity, 128] with the
+    queries [B, Hq, T, D]; k_buf/v_buf [B, Hkv, capacity, D] (D 128 or 256) with the
     first ``n_keys`` positions valid (the last T are the block's own keys).
     Row j attends keys [0 .. n_keys - T + j]. Returns [B, Hq, T, 128].
     """
     B, hq, T, head_dim = queries.shape
     hkv = k_buf.shape[1]
     gqa = hq // hkv
-    if head_dim != _HEAD_DIM:
-        raise ValueError(f"head_dim {head_dim} unsupported (need {_HEAD_DIM})")
+    if head_dim not in _HEAD_DIMS:
+        raise ValueError(f"head_dim {head_dim} unsupported (need one of {_HEAD_DIMS})")
     if gqa * T > _MAX_ROWS:
         raise ValueError(f"gqa * rows = {gqa * T} exceeds {_MAX_ROWS}")
     tiles = -(-gqa * T // 8)
+    split = _SPLIT[head_dim]
     q = queries * scale if scale != 1.0 else queries
 
     blocks = max(1, min(_MAX_BLOCKS, -(-_TARGET_GROUPS // (hkv * B)), -(-n_keys // 16)))
     params = _params(n_keys, k_buf.shape[2], v_buf.shape[2], blocks)
-    partials, sums, maxs = _pass1()(
+    partials, sums, maxs = _pass1(head_dim)(
         inputs=[q, k_buf, v_buf, params],
         template=[("T", q.dtype), ("TR", T), ("G", gqa)],
-        grid=(32 * hkv, tiles * B, blocks),
-        threadgroup=(32, tiles, 1),
+        grid=(32 * hkv, tiles * split * B, blocks),
+        threadgroup=(32, tiles * split, 1),
         output_shapes=[
             (B, hq, T, blocks, head_dim),
             (B, hq, T, blocks),
@@ -255,7 +267,7 @@ def mma_verify_sdpa(queries, k_buf, v_buf, n_keys: int, scale: float):
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    (out,) = _pass2()(
+    (out,) = _pass2(head_dim)(
         inputs=[partials, sums, maxs, params],
         template=[("T", q.dtype)],
         grid=(head_dim * B * hq, T, 1),

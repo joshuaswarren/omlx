@@ -52,18 +52,18 @@ def patched(monkeypatch):
         mod.scaled_dot_product_attention = original
 
 
-def _filled_cache(prefix=300, hkv=8, dtype=mx.bfloat16, cls=KVCache):
+def _filled_cache(prefix=300, hkv=8, dtype=mx.bfloat16, cls=KVCache, d=D):
     mx.random.seed(3)
     cache = cls()
-    k = (mx.random.normal((1, hkv, prefix, D)) * 0.5).astype(dtype)
+    k = (mx.random.normal((1, hkv, prefix, d)) * 0.5).astype(dtype)
     cache.update_and_fetch(k, k)
     return cache
 
 
-def _verify_block(cache, T, hq=32, hkv=8, dtype=mx.bfloat16):
-    q = (mx.random.normal((1, hq, T, D)) * 0.5).astype(dtype)
-    k = (mx.random.normal((1, hkv, T, D)) * 0.5).astype(dtype)
-    v = (mx.random.normal((1, hkv, T, D)) * 0.5).astype(dtype)
+def _verify_block(cache, T, hq=32, hkv=8, dtype=mx.bfloat16, d=D):
+    q = (mx.random.normal((1, hq, T, d)) * 0.5).astype(dtype)
+    k = (mx.random.normal((1, hkv, T, d)) * 0.5).astype(dtype)
+    v = (mx.random.normal((1, hkv, T, d)) * 0.5).astype(dtype)
     bk, bv = cache.update_and_fetch(k, v)
     return q, bk, bv
 
@@ -94,6 +94,27 @@ def test_routes_only_while_the_verify_flag_is_armed(patched, state):
     mx.eval(got, want)
     assert patched == []
     assert mx.array_equal(got, want).item()
+
+
+@pytest.mark.parametrize("T,hq", [(3, 24), (4, 24), (8, 16)])  # gqa * T <= 32
+def test_head_dim_256_routes_to_kernel_and_matches_stock(patched, T, hq):
+    d, hkv = 256, 4
+    cache = _filled_cache(prefix=2100, hkv=hkv, d=d)
+    q, bk, bv = _verify_block(cache, T, hq=hq, hkv=hkv, d=d)
+    got = mlx_base.scaled_dot_product_attention(q, bk, bv, cache, d**-0.5, "causal")
+    want = mx.fast.scaled_dot_product_attention(q, bk, bv, scale=d**-0.5, mask="causal")
+    mx.eval(got, want)
+    assert len(patched) == 1
+    assert mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item() < 2e-2
+
+
+def test_head_dim_256_short_context_stays_on_stock(patched):
+    # Below 2048 keys the width-256 kernel did not beat stock on 0.32.4.
+    d, hq, hkv = 256, 24, 4
+    cache = _filled_cache(prefix=1000, hkv=hkv, d=d)
+    q, bk, bv = _verify_block(cache, 4, hq=hq, hkv=hkv, d=d)
+    mlx_base.scaled_dot_product_attention(q, bk, bv, cache, d**-0.5, "causal")
+    assert patched == []
 
 
 def test_modules_that_imported_the_hook_by_name_are_rerouted(patched):

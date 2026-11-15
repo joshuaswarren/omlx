@@ -29,6 +29,25 @@ def _ref_attention(q, k_buf, v_buf, n_keys, scale):
     return mx.softmax(scores, axis=-1) @ v
 
 
+def _check_parity(B, hq, hkv, L, n_keys, cap, dtype, D):
+    mx.random.seed(7)
+    q = (mx.random.normal((B, hq, L, D)) * 0.5).astype(dtype)
+    k_buf = (mx.random.normal((B, hkv, cap, D)) * 0.5).astype(dtype)
+    v_buf = (mx.random.normal((B, hkv, cap, D)) * 0.5).astype(dtype)
+    scale = D**-0.5
+
+    got = vmk.mma_verify_sdpa(q, k_buf, v_buf, n_keys, scale)
+    want = _ref_attention(q, k_buf, v_buf, n_keys, scale)
+    mx.eval(got, want)
+
+    assert got.shape == q.shape and got.dtype == dtype
+    diff = mx.abs(got.astype(mx.float32) - want).max().item()
+    # fp32 accumulation: the only error left is rounding the result to the
+    # output dtype (bf16 8 bits, fp16 11 bits) relative to the largest value.
+    tol = 2e-2 if dtype == mx.bfloat16 else 3e-3
+    assert diff / max(mx.abs(want).max().item(), 1e-6) < tol
+
+
 @pytest.mark.parametrize(
     "B,hq,hkv,L,n_keys,cap,dtype",
     [
@@ -43,20 +62,32 @@ def _ref_attention(q, k_buf, v_buf, n_keys, scale):
     ],
 )
 def test_parity_vs_reference(B, hq, hkv, L, n_keys, cap, dtype):
-    mx.random.seed(7)
-    D = 128
-    q = (mx.random.normal((B, hq, L, D)) * 0.5).astype(dtype)
-    k_buf = (mx.random.normal((B, hkv, cap, D)) * 0.5).astype(dtype)
-    v_buf = (mx.random.normal((B, hkv, cap, D)) * 0.5).astype(dtype)
-    scale = D**-0.5
+    _check_parity(B, hq, hkv, L, n_keys, cap, dtype, 128)
 
-    got = vmk.mma_verify_sdpa(q, k_buf, v_buf, n_keys, scale)
-    want = _ref_attention(q, k_buf, v_buf, n_keys, scale)
-    mx.eval(got, want)
 
-    assert got.shape == q.shape and got.dtype == dtype
-    diff = mx.abs(got.astype(mx.float32) - want).max().item()
-    assert diff / max(mx.abs(want).max().item(), 1e-6) < 2e-2
+@pytest.mark.parametrize(
+    "B,hq,hkv,L,n_keys,cap,dtype",
+    [
+        (1, 24, 4, 2, 513, 640, mx.bfloat16),  # gqa 6, 12 rows: padded row tile
+        (1, 24, 4, 4, 4096, 4160, mx.bfloat16),  # 24 rows = three row tiles
+        (1, 8, 2, 8, 1000, 1024, mx.bfloat16),  # gqa 4, 32 rows = four row tiles
+        (1, 24, 4, 3, 300, 320, mx.float16),
+        (1, 16, 4, 5, 21, 64, mx.bfloat16),  # fewer keys than tiles x blocks
+        (1, 16, 2, 4, 777, 800, mx.bfloat16),  # gqa 8, key tail not x8
+        (2, 24, 4, 2, 129, 192, mx.bfloat16),  # batch > 1
+        (1, 8, 8, 4, 100, 128, mx.bfloat16),  # gqa 1 (no sharing)
+    ],
+)
+def test_parity_vs_reference_head256(B, hq, hkv, L, n_keys, cap, dtype):
+    _check_parity(B, hq, hkv, L, n_keys, cap, dtype, 256)
+
+
+@pytest.mark.parametrize("D", [64, 192, 512])
+def test_rejects_unsupported_head_dims(D):
+    q = mx.zeros((1, 8, 4, D), dtype=mx.bfloat16)
+    kv = mx.zeros((1, 2, 64, D), dtype=mx.bfloat16)
+    with pytest.raises(ValueError):
+        vmk.mma_verify_sdpa(q, kv, kv, 32, 1.0)
 
 
 def test_rejects_more_rows_than_one_mma_group():

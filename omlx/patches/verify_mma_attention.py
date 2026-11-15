@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 
 _MIN_ROWS = 3
 _MAX_ROWS = 8
-_HEAD_DIM = 128
+_HEAD_DIMS = (128, 256)
+# Width 256 pays from 2048 keys on (mlx 0.32.4 stock got faster there; measured
+# 0.68-0.52 of stock time at 4 rows from 2k keys, about 1.0 below 1k).
+_MIN_KEYS = {128: 0, 256: 2048}
 _DTYPES = (mx.bfloat16, mx.float16)
 
 
@@ -42,12 +45,14 @@ def route_ok(queries, keys, values, cache, mask, sinks) -> bool:
     if type(cache) is not KVCache:
         return False
     B, hq, rows, dim = queries.shape
-    if not _MIN_ROWS <= rows <= _MAX_ROWS or dim != _HEAD_DIM:
+    if not _MIN_ROWS <= rows <= _MAX_ROWS or dim not in _HEAD_DIMS:
         return False
     if queries.dtype not in _DTYPES:
         return False
     hkv, n_keys = keys.shape[1], keys.shape[2]
     if hq % hkv or (hq // hkv) * rows > 32 or n_keys != cache.offset:
+        return False
+    if n_keys < _MIN_KEYS[dim]:
         return False
     buf_k, buf_v = cache.keys, cache.values
     return (
@@ -57,9 +62,10 @@ def route_ok(queries, keys, values, cache, mask, sinks) -> bool:
         and buf_k.dtype == queries.dtype
         and buf_v.dtype == queries.dtype
         and buf_k.shape[1] == hkv
-        and buf_k.shape[3] == _HEAD_DIM
+        and buf_k.shape[3] == dim
         and buf_k.shape[2] >= n_keys
         and buf_v.shape[2] >= n_keys
+        and buf_v.shape[3] == dim
     )
 
 
