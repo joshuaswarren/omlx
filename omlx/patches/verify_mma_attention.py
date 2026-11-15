@@ -30,6 +30,7 @@ _HEAD_DIMS = (128, 256)
 _MIN_KEYS = {128: 0, 256: 2048}
 _DTYPES = (mx.bfloat16, mx.float16)
 _engaged = 0
+_probe_result = None  # None: not probed yet; a failed probe is not re-run
 
 
 def engaged_count() -> int:
@@ -38,6 +39,14 @@ def engaged_count() -> int:
 
 
 def _probe_ok() -> bool:
+    """Probe once per process and remember the answer (failures too)."""
+    global _probe_result
+    if _probe_result is None:
+        _probe_result = _run_probe()
+    return _probe_result
+
+
+def _run_probe() -> bool:
     """Run the kernel once on a tiny block and evaluate it.
 
     ``metal_kernel`` compiles and launches lazily, at ``mx.eval``, so only an
