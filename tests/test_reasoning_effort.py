@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
+
 import pytest
 
 from omlx.reasoning_effort import (
@@ -163,6 +165,36 @@ def test_harmony_unknown_values_use_native_default(value):
 
     assert render(target, value, is_harmony=True) == "Reasoning: medium"
     assert target.calls == ["medium"]
+
+
+@pytest.mark.parametrize("is_harmony", [False, True])
+def test_ignored_reasoning_effort_logs_warning_and_still_renders(caplog, is_harmony):
+    """Minefield 07: a dropped reasoning_effort must warn, not log at debug."""
+
+    class RejectingTemplate:
+        def __init__(self):
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            value = kwargs.get("reasoning_effort", "medium")
+            self.calls.append(value)
+            if "reasoning_effort" in kwargs:
+                raise ValueError(f"unsupported effort: {value}")
+            return f"effort={value}"
+
+    target = RejectingTemplate()
+
+    with caplog.at_level(logging.DEBUG, logger="omlx.reasoning_effort"):
+        rendered = render(target, "bogus", is_harmony=is_harmony)
+
+    assert rendered == "effort=medium"
+    assert target.calls[-1] == "medium"
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.WARNING and "bogus" in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def test_input_kwargs_are_not_mutated():

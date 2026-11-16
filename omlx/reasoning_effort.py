@@ -95,7 +95,7 @@ def apply_chat_template_with_reasoning_effort_fallback(
         mapped = _harmony_effort(original_value)
         if mapped is None:
             original_kwargs.pop("reasoning_effort", None)
-            logger.debug(
+            logger.warning(
                 "Harmony ignored reasoning_effort=%r and used its native default",
                 original_value,
             )
@@ -137,7 +137,7 @@ def apply_chat_template_with_reasoning_effort_fallback(
         except Exception:
             raise original_error.with_traceback(original_error.__traceback__) from None
 
-        logger.debug(
+        logger.warning(
             "Chat template ignored reasoning_effort=%r and used its native default",
             original_value,
         )
