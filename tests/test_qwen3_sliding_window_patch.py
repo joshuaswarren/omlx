@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Qwen3 sliding-window compatibility patch."""
 
+import sys
+from unittest.mock import MagicMock
+
 import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten
@@ -8,6 +11,7 @@ from mlx_lm.models import qwen3 as upstream_qwen3
 
 from omlx.patches import qwen3_sliding_window as patch_module
 from omlx.patches.qwen3_sliding_window import qwen3_model
+from omlx.utils.model_loading import maybe_apply_pre_load_patches
 
 
 def _model_args(args_class, **overrides):
@@ -89,3 +93,99 @@ def test_patch_install_is_idempotent_and_updates_live_module(monkeypatch):
     assert upstream_qwen3.ModelArgs is qwen3_model.ModelArgs
     assert upstream_qwen3.Qwen3Model is qwen3_model.Qwen3Model
     assert patch_module.apply_qwen3_sliding_window_patch() is False
+
+
+# --- Minefield 143 ---------------------------------------------------------
+# Base defect: only the Jina reranker load path applied this patch, so a
+# Qwen3 LLM whose config.json declares sliding_attention layers silently ran
+# every layer as full attention, while its declared window never reached the
+# cache-derived KV accounting either. These tests pin the LLM pre-load wiring.
+
+
+def _pre_load_dispatch_env(monkeypatch):
+    monkeypatch.setattr(
+        "omlx.utils.model_loading._patch_mlx_lm_load_config", lambda: None
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "omlx.patches.mlx_lm_mtp",
+        MagicMock(set_mtp_active=MagicMock()),
+    )
+
+
+def _dispatch_patch_mock(monkeypatch, return_value=True):
+    apply_mock = MagicMock(return_value=return_value)
+    monkeypatch.setitem(
+        sys.modules,
+        "omlx.patches.qwen3_sliding_window",
+        MagicMock(apply_qwen3_sliding_window_patch=apply_mock),
+    )
+    return apply_mock
+
+
+def test_mf143_sliding_config_applies_patch_in_pre_load_dispatch(
+    tmp_path, monkeypatch
+):
+    """A qwen3 config declaring sliding_attention layers gets the patch.
+
+    Minefield 143. On base, maybe_apply_pre_load_patches has no qwen3
+    sliding-window branch, so declared-window Qwen3 LLMs load with every
+    layer resolving to full attention.
+    """
+    _pre_load_dispatch_env(monkeypatch)
+    apply_mock = _dispatch_patch_mock(monkeypatch)
+
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen3", "sliding_window": 4096, '
+        '"layer_types": ["sliding_attention", "full_attention"]}'
+    )
+    maybe_apply_pre_load_patches(str(tmp_path))
+
+    apply_mock.assert_called_once_with()
+
+
+def test_mf143_plain_qwen3_config_skips_pre_load_patch(tmp_path, monkeypatch):
+    """A stock qwen3 config must not install the patch (minefield 143)."""
+    _pre_load_dispatch_env(monkeypatch)
+    apply_mock = _dispatch_patch_mock(monkeypatch)
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3"}')
+    maybe_apply_pre_load_patches(str(tmp_path))
+
+    apply_mock.assert_not_called()
+
+
+def test_mf143_patched_model_makes_window_bounded_caches(monkeypatch):
+    """make_cache must bound sliding layers so decode honors the window.
+
+    Minefield 143. mlx-lm builds no mask for single-token decode steps, so
+    mask-only window enforcement is silently violated during generation: a
+    sliding layer over a plain full-history KVCache attends everything.
+    The patch therefore must also provide window-bounded RotatingKVCache
+    caches for sliding layers; cache-derived memory accounting
+    (collect_kv_layer_specs) then classifies those layers as rotating, so
+    KV pricing matches the attention the model actually runs.
+    """
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from omlx.memory_monitor import collect_kv_layer_specs
+
+    monkeypatch.setattr(upstream_qwen3, "ModelArgs", upstream_qwen3.ModelArgs)
+    monkeypatch.setattr(upstream_qwen3, "Qwen3Model", upstream_qwen3.Qwen3Model)
+    monkeypatch.setattr(upstream_qwen3, "Model", upstream_qwen3.Model)
+    monkeypatch.setattr(patch_module, "_APPLIED", False)
+    assert patch_module.apply_qwen3_sliding_window_patch() is True
+
+    args = _model_args(
+        upstream_qwen3.ModelArgs,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=3,
+    )
+    model = upstream_qwen3.Model(args)
+
+    caches = model.make_cache()
+    full, rotating, arrays = collect_kv_layer_specs(caches)
+    assert (full, rotating, arrays) == (1, [(1, 3)], 0)
+    assert isinstance(caches[0], RotatingKVCache)
+    assert caches[0].max_size == 3
+    assert type(caches[1]).__name__ == "KVCache"
