@@ -161,7 +161,7 @@ class TestLifecycleCommand:
 
         assert cli.lifecycle_command(self._args("start")) == 0
         send.assert_called_once_with("start", timeout=1.0)
-        wait.assert_called_once_with({"running", "unresponsive"}, 1.0)
+        wait.assert_called_once_with({"running", "unresponsive"}, 1.0, prior_pid=None)
 
     def test_homebrew_start_delegates_to_brew_services(self, monkeypatch):
         """Homebrew installs use the Homebrew service supervisor."""
@@ -175,6 +175,120 @@ class TestLifecycleCommand:
 
         assert cli.lifecycle_command(self._args("start")) == 0
         run_brew.assert_called_once_with("start")
+
+    def test_app_bundle_start_wait_call_unchanged(self, monkeypatch):
+        """`omlx start` keeps polling for state only — no prior identity."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(return_value={"ok": True, "state": "starting", "port": 8000})
+        wait = MagicMock(return_value={"ok": True, "state": "running", "port": 8000})
+        monkeypatch.setattr(cli, "_send_app_control_with_launch", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+
+        assert cli.lifecycle_command(self._args("start")) == 0
+        wait.assert_called_once_with(
+            {"running", "unresponsive"}, 1.0, prior_pid=None
+        )
+
+    def test_wait_state_without_prior_pid_returns_on_first_running(self, monkeypatch):
+        """No prior identity (start): first running answer wins, as before."""
+        from omlx import cli
+
+        polls = MagicMock(
+            side_effect=[
+                {"ok": True, "state": "starting", "pid": 100, "port": 8000},
+                {"ok": True, "state": "running", "pid": 100, "port": 8000},
+            ]
+        )
+        monkeypatch.setattr(cli, "_send_app_control", polls)
+
+        result = cli._wait_app_control_state({"running", "unresponsive"}, 5.0)
+        assert result.get("state") == "running"
+        assert polls.call_count == 2
+
+    def test_wait_state_keeps_waiting_while_old_pid_answers(self, monkeypatch):
+        """Minefield 53: a running answer from the old pid must not count.
+
+        The pre-restart process keeps holding the port and answers `running`;
+        the helper must keep polling until the timeout instead of returning
+        success on the first answer.
+        """
+        from omlx import cli
+
+        polls = MagicMock(
+            return_value={"ok": True, "state": "running", "pid": 100, "port": 8000}
+        )
+        monkeypatch.setattr(cli, "_send_app_control", polls)
+
+        result = cli._wait_app_control_state(
+            {"running", "unresponsive"}, 1.2, prior_pid=100
+        )
+        assert result.get("pid") == 100  # stale identity, never confirmed
+        assert polls.call_count >= 2  # did not accept the first answer
+
+    def test_wait_state_returns_once_replacement_pid_answers(self, monkeypatch):
+        """Minefield 53: a different pid satisfies running + identity change."""
+        from omlx import cli
+
+        polls = MagicMock(
+            side_effect=[
+                {"ok": True, "state": "running", "pid": 100, "port": 8000},
+                {"ok": True, "state": "running", "pid": 200, "port": 8000},
+            ]
+        )
+        monkeypatch.setattr(cli, "_send_app_control", polls)
+
+        result = cli._wait_app_control_state(
+            {"running", "unresponsive"}, 5.0, prior_pid=100
+        )
+        assert result.get("pid") == 200
+        assert polls.call_count == 2
+
+    def test_app_bundle_restart_confirms_replacement(self, monkeypatch, capsys):
+        """Minefield 53: `omlx restart` passes the pre-restart pid to the wait."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(return_value={"ok": True, "state": "restarting", "port": 8000})
+        wait = MagicMock(return_value={"ok": True, "state": "running", "pid": 200, "port": 8000})
+        monkeypatch.setattr(cli, "_send_app_control_with_launch", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+        monkeypatch.setattr(
+            cli, "_send_app_control", MagicMock(
+                return_value={"ok": True, "state": "running", "pid": 100, "port": 8000}
+            )
+        )
+
+        assert cli.lifecycle_command(self._args("restart")) == 0
+        wait.assert_called_once_with(
+            {"running", "unresponsive"}, 1.0, prior_pid=100
+        )
+        assert "restarted" in capsys.readouterr().out
+
+    def test_app_bundle_restart_reports_stale_process_on_timeout(
+        self, monkeypatch, capsys
+    ):
+        """Minefield 53: timeout with the old pid still answering fails loudly."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        monkeypatch.setattr(
+            cli, "_send_app_control", MagicMock(
+                return_value={"ok": True, "state": "running", "pid": 100, "port": 8000}
+            )
+        )
+
+        assert cli.lifecycle_command(self._args("restart")) == 1
+        out = capsys.readouterr().out
+        assert "pid 100" in out
+        assert "restarted" not in out
 
 
 class TestCLIEntryPoint:

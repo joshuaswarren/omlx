@@ -770,14 +770,26 @@ def _send_app_control_with_launch(command: str, timeout: float) -> dict:
     raise RuntimeError(f"Could not reach oMLX.app control socket: {last_error}")
 
 
-def _wait_app_control_state(states: set[str], timeout: float) -> dict:
+def _wait_app_control_state(
+    states: set[str], timeout: float, prior_pid: int | None = None
+) -> dict:
+    """Poll app-control status until `states` is reached.
+
+    With `prior_pid` set (restart flow, minefield 53), a `running` answer
+    from the *old* server process does not count: the old process can keep
+    holding the port after a no-op restart and still report healthy. The
+    poll only returns early once the answering pid differs from `prior_pid`;
+    otherwise it waits out the timeout and returns the last status.
+    """
     import time
 
     deadline = time.monotonic() + timeout
     last: dict = {}
     while time.monotonic() < deadline:
         last = _send_app_control("status")
-        if last.get("state") in states:
+        if last.get("state") in states and (
+            prior_pid is None or last.get("pid") not in (None, prior_pid)
+        ):
             return last
         time.sleep(0.5)
     return last
@@ -805,6 +817,15 @@ def lifecycle_command(args) -> int:
 
     if is_app_bundle():
         try:
+            prior_pid = None
+            if command == "restart":
+                # Minefield 53: capture the old process identity so the wait
+                # can tell a real replacement from the stale process still
+                # holding the port. No answer before restart = no identity.
+                try:
+                    prior_pid = _send_app_control("status").get("pid")
+                except OSError:
+                    prior_pid = None
             if command == "stop":
                 try:
                     response = _send_app_control(command)
@@ -818,11 +839,23 @@ def lifecycle_command(args) -> int:
                 return 1
 
             if command in {"start", "restart"} and not no_wait:
-                response = _wait_app_control_state({"running", "unresponsive"}, timeout)
+                response = _wait_app_control_state(
+                    {"running", "unresponsive"}, timeout, prior_pid=prior_pid
+                )
                 if response.get("state") not in {"running", "unresponsive"}:
                     print(
                         f"oMLX server is {response.get('state', 'unknown')} "
                         f"after {int(timeout)}s."
+                    )
+                    return 1
+                if prior_pid is not None and response.get("pid") in (
+                    None,
+                    prior_pid,
+                ):
+                    print(
+                        f"oMLX restart did not take effect: previous server "
+                        f"process (pid {prior_pid}) is still answering after "
+                        f"{int(timeout)}s."
                     )
                     return 1
 
