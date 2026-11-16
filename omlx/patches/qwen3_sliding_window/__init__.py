@@ -13,8 +13,9 @@ model load. So patching the module's attributes before any load is
 enough for both Jina and any other Qwen3 model to pick them up.
 self.model = Qwen3Model(args) in Model.__init__ resolves the bare name
 against that same module's namespace at instantiation time, so Model
-itself needs no changes and is reused verbatim, along with Attention, MLP,
-and TransformerBlock.
+itself is reused verbatim for construction (it is subclassed only to add
+a window-aware make_cache; see qwen3_model.Model), along with Attention,
+MLP, and TransformerBlock.
 
 There's no known upstream proposal for Qwen3 sliding-window support
 at the time of writing, so there's no PR reference to carry here
@@ -37,6 +38,7 @@ def _patch_qwen3_module() -> None:
 
     _qwen3.ModelArgs = qwen3_model.ModelArgs
     _qwen3.Qwen3Model = qwen3_model.Qwen3Model
+    _qwen3.Model = qwen3_model.Model
 
 
 def apply_qwen3_sliding_window_patch() -> bool:

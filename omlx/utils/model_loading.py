@@ -516,6 +516,12 @@ def _config_model_type(model_path: str | Path) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _qwen3_declares_sliding_window(config: dict) -> bool:
+    """True when a qwen3 config declares sliding_attention layers."""
+    layer_types = config.get("layer_types")
+    return isinstance(layer_types, list) and "sliding_attention" in layer_types
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -545,6 +551,13 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
+    - Qwen3 sliding-window patch when ``config.json`` declares
+      ``model_type == "qwen3"`` whose ``layer_types`` include
+      ``sliding_attention``. Without it the pinned mlx-lm Qwen3 loader runs
+      every layer as full attention; the patched model honors the declared
+      per-layer attention and its ``make_cache`` yields window-bounded
+      rotating caches, so cache-derived memory accounting matches the
+      attention actually run (minefield 143).
     - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
@@ -764,6 +777,16 @@ def maybe_apply_pre_load_patches(
 
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
+
+    if model_type == "qwen3" and _qwen3_declares_sliding_window(config):
+        from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
+
+        if apply_qwen3_sliding_window_patch():
+            logger.info(
+                "Qwen3 sliding-window pre-load patch applied for %s "
+                "(config declares sliding_attention layers)",
+                model_name,
+            )
 
     if model_type == "inkling2":
         from ..patches.inkling2 import apply_inkling2_patch

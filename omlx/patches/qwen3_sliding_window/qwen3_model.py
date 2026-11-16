@@ -30,6 +30,7 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm.models import qwen3 as _qwen3
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
+from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -122,3 +123,25 @@ class Qwen3Model(_qwen3.Qwen3Model):
                 h = layer(h, mask=(swa_mask if is_sliding else full_mask), cache=c)
 
         return self.norm(h)
+
+
+class Model(_qwen3.Model):
+    """Upstream Model plus a window-aware make_cache.
+
+    mlx-lm builds no mask for single-token decode steps, so mask-only window
+    enforcement cannot hold during generation: a sliding layer over a plain
+    full-history KVCache would attend the whole context. Sliding layers need
+    physically window-bounded RotatingKVCache caches instead. Cache-derived
+    memory accounting (collect_kv_layer_specs, Scheduler, prefill guard) then
+    classifies those layers as rotating, so KV pricing matches the attention
+    the model actually runs.
+    """
+
+    def make_cache(self):
+        caches = []
+        for is_sliding in self.model.is_sliding:
+            if is_sliding and self.model.window_size:
+                caches.append(RotatingKVCache(max_size=self.model.window_size))
+            else:
+                caches.append(KVCache())
+        return caches
