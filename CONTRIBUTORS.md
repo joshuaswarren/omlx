@@ -197,6 +197,7 @@
 - [@scaryrawr](https://github.com/scaryrawr)
 - [@scubamount](https://github.com/scubamount)
 - [@sdiamanEXUS](https://github.com/sdiamanEXUS)
+- [@seeker-cyber-maker](https://github.com/seeker-cyber-maker)
 - [@shannonsands](https://github.com/shannonsands)
 - [@SheeJiaWei](https://github.com/SheeJiaWei)
 - [@ShiroKSH](https://github.com/ShiroKSH)
