@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omlx.api.thinking import extract_thinking
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -1468,3 +1469,57 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_prompt_opened_think_recovers_short_answer():
+    """mf-162: prompt-opened think must not file a short answer as reasoning.
+
+    With thinking on, the chat template pre-opens the think block and a short
+    answer finishes without ever emitting </think>. The rank-zero backend then
+    reports reasoning=R with empty content and finish_reason stop, and the
+    engine used to rejoin the channels as a closed <think>R</think> block, so
+    the whole answer was filed as reasoning and content stayed empty. Leaving
+    the block unclosed lets the prompt-opened recovery paths return the answer
+    as content, matching the local engine. The assertion mirrors the server's
+    non-stream split with start_in_thinking=True.
+    """
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning": "Short answer: yes.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                },
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat([{"role": "user", "content": "Yes or no?"}])
+    finally:
+        await engine._client.aclose()
+
+    thinking, content = extract_thinking(
+        output.text,
+        truncated=output.finish_reason == "length",
+        start_in_thinking=True,
+    )
+    assert content == "Short answer: yes."
+    assert thinking == ""
+    assert output.finish_reason == "stop"
+    assert output.tool_calls is None
