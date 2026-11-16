@@ -436,6 +436,7 @@ class DiscoveredModel:
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
+    native_context: int | None = None  # Trained length from rope-scaling metadata (original_max_position_embeddings; None if unknown) — minefield 55/87
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
@@ -1013,6 +1014,20 @@ _CONTEXT_LENGTH_KEYS = (
 _TOKENIZER_MAX_LENGTH_SENTINEL = 10**18
 
 
+def _load_model_config_dict(model_path: Path) -> dict:
+    """config.json contents, or ``{}`` when missing or unreadable."""
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            model_config = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(f"Failed to read config.json for {model_path}: {e}")
+        return {}
+    return model_config if isinstance(model_config, dict) else {}
+
+
 def _read_model_context_length(model_path: Path) -> int | None:
     """Discover the declared context length from a model's config files.
 
@@ -1031,27 +1046,20 @@ def _read_model_context_length(model_path: Path) -> int | None:
         Positive integer context length, or ``None`` when no usable
         value was found in any of the above.
     """
-    config_path = model_path / "config.json"
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                model_config = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            logger.debug(f"Failed to read config.json for {model_path}: {e}")
-            model_config = {}
+    model_config = _load_model_config_dict(model_path)
 
-        for key in _CONTEXT_LENGTH_KEYS:
-            value = model_config.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
+    for key in _CONTEXT_LENGTH_KEYS:
+        value = model_config.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
 
-        for nest_key in ("text_config", "language_config"):
-            nested = model_config.get(nest_key)
-            if isinstance(nested, dict):
-                for key in _CONTEXT_LENGTH_KEYS:
-                    value = nested.get(key)
-                    if isinstance(value, int) and value > 0:
-                        return value
+    for nest_key in ("text_config", "language_config"):
+        nested = model_config.get(nest_key)
+        if isinstance(nested, dict):
+            for key in _CONTEXT_LENGTH_KEYS:
+                value = nested.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
 
     tc_path = model_path / "tokenizer_config.json"
     if tc_path.exists():
@@ -1066,6 +1074,60 @@ def _read_model_context_length(model_path: Path) -> int | None:
         if isinstance(value, int) and 0 < value < _TOKENIZER_MAX_LENGTH_SENTINEL:
             return value
 
+    return None
+
+
+def _native_length_from_config(model_config: dict) -> int | None:
+    """Trained context length from a config dict (minefield 55/87).
+
+    Reads ``original_max_position_embeddings`` — the yarn/rope-scaling
+    trained length — at the top level first, then inside ``rope_scaling``.
+    """
+    for source in (model_config, model_config.get("rope_scaling")):
+        if isinstance(source, dict):
+            value = source.get("original_max_position_embeddings")
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def _read_native_context_length(model_path: Path) -> int | None:
+    """Discover a model's trained context length from rope-scaling metadata.
+
+    Minefield 55/87: on yarn/rope-scaling checkpoints the advertised
+    ``max_position_embeddings`` is the *extended* window while the trained
+    length lives in ``original_max_position_embeddings`` (top level, or the
+    ``rope_scaling.original_max_position_embeddings`` variant). /v1/models
+    exposes this as ``native_context`` alongside ``context_source`` so
+    clients can tell a rope-extended window from a genuinely long one.
+
+    Resolution order:
+
+    1. Top-level ``config.json`` key, then ``rope_scaling``.
+    2. Nested ``text_config`` / ``language_config`` (same order within
+       each), for VLM wrappers and Qwen-style MoE configs.
+
+    Unlike :func:`_read_model_context_length` there is no tokenizer
+    fallback: ``model_max_length`` says nothing about rope scaling.
+
+    Returns:
+        Positive integer trained context length, or ``None`` when the
+        config carries no rope-scaling trained length.
+    """
+    model_config = _load_model_config_dict(model_path)
+    if not model_config:
+        return None
+
+    native = _native_length_from_config(model_config)
+    if native is not None:
+        return native
+
+    for nest_key in ("text_config", "language_config"):
+        nested = model_config.get(nest_key)
+        if isinstance(nested, dict):
+            native = _native_length_from_config(nested)
+            if native is not None:
+                return native
     return None
 
 
@@ -1809,6 +1871,7 @@ def _register_model(
             preserve_thinking_default=preserve_thinking_default,
             reasoning_efforts=reasoning_efforts,
             model_context_length=model_context_length,
+            native_context=_read_native_context_length(model_dir),
             source_type=source_type,
             source_repo_id=source_repo_id,
             is_helper=is_helper,
@@ -1885,6 +1948,7 @@ def _register_gguf_model(
             preserve_thinking_default=detect_preserve_thinking(folder, template_text),
             reasoning_efforts=detect_reasoning_effort(folder, template_text),
             model_context_length=_read_model_context_length(folder),
+            native_context=_read_native_context_length(folder),
             source_type=source_type,
             source_repo_id=source_repo_id,
             model_format="gguf",

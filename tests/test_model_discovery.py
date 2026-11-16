@@ -17,6 +17,7 @@ from omlx.model_discovery import (
     _is_hf_cache_mlx_compatible,
     _is_unsupported_model,
     _read_model_context_length,
+    _read_native_context_length,
     _register_model,
     _resolve_hf_cache_entry,
     _vision_weight_bytes,
@@ -1755,6 +1756,88 @@ class TestReadModelContextLength:
         """A broken config.json must not raise — discovery should keep going."""
         (tmp_path / "config.json").write_text("{not valid json")
         assert _read_model_context_length(tmp_path) is None
+
+
+class TestReadNativeContextLength:
+    """Minefield 55/87: ``original_max_position_embeddings`` is the trained
+    context length behind yarn/rope-scaling; ``max_position_embeddings`` on
+    such configs is the extended (advertised) window. Discovery must read
+    both so /v1/models can tag ``context_source``."""
+
+    def _write(self, tmp_path, config=None, tokenizer_config=None):
+        if config is not None:
+            (tmp_path / "config.json").write_text(json.dumps(config))
+        if tokenizer_config is not None:
+            (tmp_path / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+
+    def test_yarn_extended_window(self, tmp_path):
+        """max_position_embeddings=1M with trained length 64K: native is 64K."""
+        self._write(tmp_path, config={
+            "max_position_embeddings": 1000000,
+            "original_max_position_embeddings": 65536,
+        })
+        assert _read_model_context_length(tmp_path) == 1000000
+        assert _read_native_context_length(tmp_path) == 65536
+
+    def test_rope_scaling_variant(self, tmp_path):
+        """Some configs carry the trained length only inside rope_scaling."""
+        self._write(tmp_path, config={
+            "max_position_embeddings": 1000000,
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "original_max_position_embeddings": 65536,
+            },
+        })
+        assert _read_native_context_length(tmp_path) == 65536
+
+    def test_top_level_wins_over_rope_scaling(self, tmp_path):
+        self._write(tmp_path, config={
+            "original_max_position_embeddings": 65536,
+            "rope_scaling": {"original_max_position_embeddings": 8192},
+        })
+        assert _read_native_context_length(tmp_path) == 65536
+
+    def test_no_rope_metadata_returns_none(self, tmp_path):
+        """A plain model without scaling has no separate trained length."""
+        self._write(tmp_path, config={"max_position_embeddings": 32768})
+        assert _read_native_context_length(tmp_path) is None
+
+    def test_nested_text_config(self, tmp_path):
+        self._write(tmp_path, config={
+            "text_config": {"original_max_position_embeddings": 8192},
+        })
+        assert _read_native_context_length(tmp_path) == 8192
+
+    def test_invalid_types_rejected(self, tmp_path):
+        self._write(tmp_path, config={"original_max_position_embeddings": "big"})
+        assert _read_native_context_length(tmp_path) is None
+        sub = tmp_path / "zero"
+        sub.mkdir()
+        self._write(sub, config={"original_max_position_embeddings": 0})
+        assert _read_native_context_length(sub) is None
+
+    def test_no_config_returns_none(self, tmp_path):
+        assert _read_native_context_length(tmp_path) is None
+
+
+class TestNativeContextDiscoveryWiring:
+    """Minefield 55/87: DiscoveredModel must carry native_context through
+    discovery, next to the advertised model_context_length."""
+
+    def test_discovery_stores_native_context(self, tmp_path):
+        path = tmp_path / "yarn-model"
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps({
+            "model_type": "llama",
+            "max_position_embeddings": 1000000,
+            "original_max_position_embeddings": 65536,
+        }))
+        (path / "model.safetensors").write_bytes(b"0" * 1000)
+
+        models = discover_models(tmp_path)
+        model = models["yarn-model"]
+        assert model.model_context_length == 1000000
+        assert model.native_context == 65536
 
 
 class TestTwoLevelDiscovery:

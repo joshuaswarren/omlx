@@ -2359,6 +2359,44 @@ def _configured_max_context_window(model_id: str | None = None) -> int | None:
     return _server_state.sampling.max_context_window
 
 
+def _pool_native_context(model_id: str | None) -> int | None:
+    """Trained context length discovered from rope-scaling metadata.
+
+    Minefield 55/87: mirrors how :func:`get_max_context_window` reads the
+    pool entry, but returns the trained length (``original_max_position_
+    embeddings``) rather than the advertised window.
+    """
+    pool = _server_state.engine_pool
+    if not model_id or pool is None:
+        return None
+    native = getattr(pool.get_entry(resolve_model_id(model_id)), "native_context", None)
+    if isinstance(native, int) and native > 0:
+        return native
+    return None
+
+
+def _model_context_metadata(
+    model_id: str | None, advertised: int | None
+) -> tuple[int | None, str]:
+    """(native_context, context_source) for a /v1/models entry — minefield 55/87.
+
+    Tags where ``max_model_len`` came from without changing its value: a
+    per-model ``max_context_window`` override wins ("override"); otherwise a
+    window exceeding the trained length is a rope/yarn extension
+    ("rope_extended"); otherwise the model's own ("native"); and "unknown"
+    when no trained length was discoverable.
+    """
+    native = _pool_native_context(model_id)
+    settings = get_model_settings_for_request(model_id)
+    if settings is not None and settings.max_context_window is not None:
+        return native, "override"
+    if native is None:
+        return None, "unknown"
+    if advertised is not None and advertised > native:
+        return native, "rope_extended"
+    return native, "native"
+
+
 def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
@@ -3861,12 +3899,18 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 continue
             if ms is not None and ms.is_favorite:
                 favorite_ids.add(display_id)
+            max_model_len = get_max_context_window(model_id)
+            native_context, context_source = _model_context_metadata(
+                model_id, max_model_len
+            )
             models.append(
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
                     model_type=m.get("model_type"),
-                    max_model_len=get_max_context_window(model_id),
+                    max_model_len=max_model_len,
+                    native_context=native_context,
+                    context_source=context_source,
                 )
             )
         # Both sets are needed by the exposed-profile and Claude tier-alias
@@ -3884,12 +3928,18 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     or profile_model_id in existing_ids
                 ):
                     continue
+                profile_max_model_len = get_max_context_window(profile_model_id)
+                profile_native, profile_source = _model_context_metadata(
+                    profile_model_id, profile_max_model_len
+                )
                 models.append(
                     ModelInfo(
                         id=profile_model_id,
                         owned_by="omlx",
                         model_type=model_types.get(source_model_id),
-                        max_model_len=get_max_context_window(profile_model_id),
+                        max_model_len=profile_max_model_len,
+                        native_context=profile_native,
+                        context_source=profile_source,
                     )
                 )
                 existing_ids.add(profile_model_id)
@@ -3933,12 +3983,18 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 tier_ms = get_model_settings_for_request(tier_model)
                 if tier_ms is not None and tier_ms.max_tokens is not None:
                     max_tokens = tier_ms.max_tokens
+                tier_max_model_len = get_max_context_window(tier_model)
+                tier_native, tier_source = _model_context_metadata(
+                    tier_model, tier_max_model_len
+                )
                 models.append(
                     ClaudeTierModelInfo(
                         id=slot_id,
                         owned_by="omlx",
                         model_type=model_types.get(tier_model),
-                        max_model_len=get_max_context_window(tier_model),
+                        max_model_len=tier_max_model_len,
+                        native_context=tier_native,
+                        context_source=tier_source,
                         display_name=tier_model,
                         created_at=created_at,
                         anthropic_family_tier=CLAUDE_DESKTOP_TIER_FAMILY.get(slot_id),

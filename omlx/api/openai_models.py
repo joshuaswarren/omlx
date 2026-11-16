@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Annotated, Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -676,6 +676,15 @@ class ModelInfo(BaseModel):
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
+    # Minefield 55/87: ``max_model_len`` may be a rope/yarn-extended window
+    # while the model's trained length (``original_max_position_embeddings``)
+    # is much smaller. ``native_context`` carries that trained length when
+    # discovery found one, and ``context_source`` tags where the advertised
+    # number came from, without changing max_model_len semantics.
+    native_context: int | None = None
+    context_source: Literal["native", "rope_extended", "override", "unknown"] = (
+        "unknown"
+    )
     # Claude Desktop (Anthropic gateway mode) extensions. Only serialized on
     # derived Claude tier alias entries (see ClaudeTierModelInfo below);
     # excluded by default so standard entries omit tier-specific metadata.

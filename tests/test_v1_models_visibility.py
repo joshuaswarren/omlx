@@ -23,6 +23,10 @@ class _Pool:
     def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
         return model_id_or_alias
 
+    def get_entry(self, model_id):
+        # No per-model metadata (native_context, planned window) in this stub.
+        return None
+
     def get_status(self) -> dict:
         return {
             "final_ceiling": 0,
@@ -224,3 +228,78 @@ def test_hidden_favorite_still_excluded(tmp_path):
         "chat-b", ModelSettings(is_hidden=True, is_favorite=True)
     )
     assert _list_ids(state) == ["chat-a"]
+
+
+class _Entry:
+    """Pool entry stub carrying discovery-time context metadata."""
+
+    def __init__(self, native_context=None):
+        self.native_context = native_context
+
+
+class _ContextPool(_Pool):
+    """_Pool stub plus get_entry() for trained-length lookups."""
+
+    def __init__(self, models, entries):
+        super().__init__(models)
+        self._entries = entries
+
+    def get_entry(self, model_id):
+        return self._entries.get(model_id)
+
+
+def _models_payload(state, *, max_context=None):
+    with (
+        patch("omlx.server._server_state", state),
+        patch("omlx.server.get_max_context_window", return_value=max_context),
+    ):
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/v1/models")
+    assert response.status_code == 200
+    return {m["id"]: m for m in response.json()["data"]}
+
+
+def test_models_payload_reports_native_context_and_source(tmp_path):
+    """Minefield 55/87: an advertised 1M window on a 64K-trained yarn model
+    must expose native_context=65536 and context_source="rope_extended"."""
+    models = [_model("yarn-1m")]
+    state = _state(models, tmp_path)
+    state.engine_pool = _ContextPool(models, {"yarn-1m": _Entry(native_context=65536)})
+    entry = _models_payload(state, max_context=1000000)["yarn-1m"]
+    assert entry["max_model_len"] == 1000000
+    assert entry["native_context"] == 65536
+    assert entry["context_source"] == "rope_extended"
+
+
+def test_models_payload_native_context_without_extension(tmp_path):
+    """Advertised window within the trained length is plain "native"."""
+    models = [_model("plain-64k")]
+    state = _state(models, tmp_path)
+    state.engine_pool = _ContextPool(models, {"plain-64k": _Entry(native_context=65536)})
+    entry = _models_payload(state, max_context=65536)["plain-64k"]
+    assert entry["native_context"] == 65536
+    assert entry["context_source"] == "native"
+
+
+def test_models_payload_override_source(tmp_path):
+    """A per-model max_context_window override tags context_source="override"."""
+    models = [_model("plain-64k")]
+    state = _state(models, tmp_path)
+    state.engine_pool = _ContextPool(models, {"plain-64k": _Entry(native_context=65536)})
+    state.settings_manager.set_settings(
+        "plain-64k", ModelSettings(max_context_window=32768)
+    )
+    entry = _models_payload(state, max_context=32768)["plain-64k"]
+    assert entry["max_model_len"] == 32768
+    assert entry["native_context"] == 65536
+    assert entry["context_source"] == "override"
+
+
+def test_models_payload_unknown_source_without_native(tmp_path):
+    """No trained length discoverable: native_context is null, source unknown."""
+    models = [_model("opaque")]
+    state = _state(models, tmp_path)
+    state.engine_pool = _ContextPool(models, {"opaque": _Entry(native_context=None)})
+    entry = _models_payload(state, max_context=32768)["opaque"]
+    assert entry["native_context"] is None
+    assert entry["context_source"] == "unknown"
