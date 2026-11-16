@@ -824,6 +824,53 @@ class TestSchedulerAddRequest:
         mock_model.make_cache = lambda: [type("KVCache", (), {})()]
         assert scheduler._model_has_unreconstructible_cache() is False
 
+    def test_unreconstructible_cache_disable_is_a_visible_warning(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        """Minefield 47: the model-wide prefix cache disable must warn, not whisper."""
+        mock_model.make_cache = lambda: [type("RingSlidingKVCache", (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        with caplog.at_level("WARNING"):
+            assert scheduler._model_has_unreconstructible_cache() is True
+
+        assert any(
+            record.levelname == "WARNING"
+            and "Prefix cache storage and reuse disabled" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_prefix_cache_disabled_state_is_exposed_for_status(
+        self, mock_model, mock_tokenizer
+    ):
+        """Minefield 47: the model status payload must carry the disable state."""
+        mock_model.make_cache = lambda: [type("RingSlidingKVCache", (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+        status = scheduler.prefix_cache_status()
+        assert status["prefix_cache_disabled"] is True
+        assert "RingSlidingKVCache" in status["prefix_cache_disabled_reason"]
+
+    def test_prefix_cache_status_false_for_supported_models(
+        self, mock_model, mock_tokenizer
+    ):
+        """Minefield 47: supported cache layouts must not report a disable."""
+        mock_model.make_cache = lambda: [KVCache()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+        assert scheduler.prefix_cache_status() == {
+            "prefix_cache_disabled": False,
+            "prefix_cache_disabled_reason": None,
+        }
+
     def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
         self, mock_model, mock_tokenizer
     ):

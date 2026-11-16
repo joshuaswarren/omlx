@@ -3228,6 +3228,23 @@ class EnginePool:
         except AttributeError:
             return None
 
+    @staticmethod
+    def _prefix_cache_status(entry: EngineEntry) -> dict:
+        """Minefield 47: surface the scheduler's model-wide prefix cache disable."""
+        scheduler = (
+            EnginePool._resolve_scheduler_from_engine(entry.engine)
+            if entry.engine is not None
+            else None
+        )
+        status_fn = getattr(scheduler, "prefix_cache_status", None)
+        if not callable(status_fn):
+            # Unloaded model, Splash/cluster engine, or non-standard scheduler.
+            return {
+                "prefix_cache_disabled": False,
+                "prefix_cache_disabled_reason": None,
+            }
+        return status_fn()
+
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
         if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
@@ -4853,6 +4870,7 @@ class EnginePool:
                     "model_format": e.model_format,
                     "source_path": e.source_path,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    **self._prefix_cache_status(e),
                 }
             )
         return {

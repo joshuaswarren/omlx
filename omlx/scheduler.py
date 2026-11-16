@@ -11079,6 +11079,10 @@ class Scheduler:
         """Refuse paged storage and reuse for unsupported cache layouts.
 
         Memoize successful probes only; retry cache-construction failures.
+
+        Minefield 47: the disable is model-wide and silent at info level; it
+        now warns and is exposed via :meth:`prefix_cache_status` so status
+        payloads can show why prefix caching is off.
         """
         cached = getattr(self, "_unreconstructible_cache_model", None)
         if cached is not None:
@@ -11099,7 +11103,7 @@ class Scheduler:
         result = False
         for layer in layers:
             if not self._cache_layer_is_reconstructible(layer):
-                logger.info(
+                logger.warning(
                     "Prefix cache storage and reuse disabled: unsupported %s layers",
                     type(layer).__name__,
                 )
@@ -11107,7 +11111,22 @@ class Scheduler:
                 break
 
         self._unreconstructible_cache_model = result
+        self._prefix_cache_disabled_reason = (
+            f"unsupported {type(layer).__name__} layers" if result else None
+        )
         return result
+
+    def prefix_cache_status(self) -> dict:
+        """Model-wide prefix cache disable state for status payloads (minefield 47)."""
+        disabled = getattr(self, "_unreconstructible_cache_model", None) is True
+        return {
+            "prefix_cache_disabled": disabled,
+            "prefix_cache_disabled_reason": (
+                getattr(self, "_prefix_cache_disabled_reason", None)
+                if disabled
+                else None
+            ),
+        }
 
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
