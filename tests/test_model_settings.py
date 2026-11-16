@@ -760,6 +760,38 @@ class TestModelSettingsManager:
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
+    def test_merge_explicit_thinking_toggles_block_request_override(self):
+        """mf-omlx-29: settings-level thinking toggles cannot be re-enabled by request."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        assert merge_chat_template_request_kwargs(
+            ModelSettings(enable_thinking=False),
+            {"enable_thinking": True, "reasoning_effort": "low"},
+        ) == {"enable_thinking": False, "reasoning_effort": "low"}
+
+        assert merge_chat_template_request_kwargs(
+            ModelSettings(enable_thinking=True),
+            {"enable_thinking": False},
+        ) == {"enable_thinking": True}
+
+        assert merge_chat_template_request_kwargs(
+            ModelSettings(preserve_thinking=False),
+            {"preserve_thinking": True},
+        ) == {"preserve_thinking": False}
+
+    def test_merge_unset_thinking_toggles_leave_request_in_charge(self):
+        """mf-omlx-29: None toggles must not force — request kwargs still win."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings()
+        assert settings.enable_thinking is None
+        assert settings.preserve_thinking is None
+
+        assert merge_chat_template_request_kwargs(
+            settings,
+            {"enable_thinking": True, "preserve_thinking": True, "other": 1},
+        ) == {"enable_thinking": True, "preserve_thinking": True, "other": 1}
+
     @pytest.mark.parametrize("budget", [None, 0, 1])
     @pytest.mark.parametrize("enabled", [None, True, False])
     def test_budget_respects_explicit_thinking_mode(self, budget, enabled):
