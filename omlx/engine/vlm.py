@@ -2563,7 +2563,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_sdpa256_attention_patch()
             except Exception:
-                logger.debug("sdpa256 attention patch not applied", exc_info=True)
+                logger.warning(
+                    "sdpa256 attention patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
         # Installed after sdpa256 so matched Qwen dense attention takes the
@@ -2579,7 +2582,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_fa256_attention_patch()
             except Exception:
-                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+                logger.warning(
+                    "Qwen FA-256 steel patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen3.5/3.6 verify-width GDN prework -> one fused Metal launch
         # (conv+SiLU+split+RMS+scale+conv-state), bit-exact to the chain.
@@ -2597,7 +2603,10 @@ class VLMBatchedEngine(BaseEngine):
             )
             apply_qwen35_gdn_prework_patch()
         except Exception:
-            logger.debug("Qwen GDN prework patch not applied", exc_info=True)
+            logger.warning(
+                "Qwen GDN prework patch not applied; using stock path",
+                exc_info=True,
+            )
 
         # Qwen3.5/3.6 verify-width (MTP target-verify) attention -> chunked
         # causal vector-kernel calls instead of the per-row SDPA loop.
@@ -2608,8 +2617,9 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_verify_sdpa_split_patch()
         except Exception:
-            logger.debug(
-                "Qwen verify-split attention patch not applied", exc_info=True
+            logger.warning(
+                "Qwen verify-split attention patch not applied; using stock path",
+                exc_info=True,
             )
 
         # Qwen3.5/3.6 Gated DeltaNet prefill -> optimized Metal kernel.
@@ -2627,7 +2637,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_gdn_prefill_patch()
             except Exception:
-                logger.debug("GDN prefill patch not applied", exc_info=True)
+                logger.warning(
+                    "GDN prefill patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen3.5/3.6 q4 MLP prefill -> native qmm tile tuned for long batches.
         # Decode and target-verify paths keep the original QuantizedLinear.
@@ -2649,7 +2662,10 @@ class VLMBatchedEngine(BaseEngine):
                 # compat patch installed the vendored module.
                 apply_muse_glimmer_q4_prefill_patch()
             except Exception:
-                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+                logger.warning(
+                    "Qwen q4 MLP prefill patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Flint MoE decode: sigmoid top-k routing and the weighted combine
         # (plus shared expert and residual) in one launch each per layer.
@@ -2659,7 +2675,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_flint_decode_patch()
             except Exception:
-                logger.debug("Flint decode patch not applied", exc_info=True)
+                logger.warning(
+                    "Flint decode patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # LFM3 text tower (shared by LFM3, -VL, -Audio and -Omni): one-launch
         # RoPE instead of about fifteen array ops per q/k call.
@@ -2669,7 +2688,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_lfm3_rope_patch()
             except Exception:
-                logger.debug("LFM3 fast RoPE patch not applied", exc_info=True)
+                logger.warning(
+                    "LFM3 fast RoPE patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
@@ -2680,7 +2702,10 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_moe_router_patch()
         except Exception:
-            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+            logger.warning(
+                "Qwen MoE router patch not applied; using stock path",
+                exc_info=True,
+            )
 
         # One-token routed experts: gate+up/SwiGLU and down/weighted-sum in
         # two launches instead of five (bit-identical; needs the router patch).
@@ -2691,7 +2716,10 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_moe_routed_decode_patch()
         except Exception:
-            logger.debug("Qwen MoE routed decode patch not applied", exc_info=True)
+            logger.warning(
+                "Qwen MoE routed decode patch not applied; using stock path",
+                exc_info=True,
+            )
 
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
@@ -2719,7 +2747,10 @@ class VLMBatchedEngine(BaseEngine):
                     ),
                 )
             except Exception:
-                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+                logger.warning(
+                    "oQ A8 prefill patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         if ane_count or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0):
             try:
@@ -2757,8 +2788,9 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug(
-                    "Qwen MoE weighted-sum patch not applied", exc_info=True
+                logger.warning(
+                    "Qwen MoE weighted-sum patch not applied; using stock path",
+                    exc_info=True,
                 )
 
         if (
@@ -2772,7 +2804,10 @@ class VLMBatchedEngine(BaseEngine):
 
                 apply_qwen35_ragged_decode_patch()
             except Exception:
-                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+                logger.warning(
+                    "qwen3_5 ragged decode patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Padded batches the ragged/verify kernels refuse -> batch-1 attention
         # per row. Applied after the patches above so it wraps them.
@@ -2783,7 +2818,10 @@ class VLMBatchedEngine(BaseEngine):
 
             apply_qwen35_padded_row_attention_patch()
         except Exception:
-            logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
+            logger.warning(
+                "qwen3_5 padded-row attention patch not applied; using stock path",
+                exc_info=True,
+            )
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler

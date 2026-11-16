@@ -336,7 +336,9 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
 
     kernel = _native_kernel()
     if kernel is None:
-        logger.debug("Qwen FA-256 steel kernel unavailable; patch skipped")
+        logger.warning(
+            "Qwen FA-256 steel kernel unavailable; patch skipped, stock SDPA in use"
+        )
         return False
 
     min_kv_len = min_kv_len or 2048

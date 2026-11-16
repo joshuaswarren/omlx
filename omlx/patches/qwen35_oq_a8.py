@@ -573,7 +573,9 @@ def apply_qwen35_oq_a8_patch(
     global _MLP_PATCHED, _GDN_REGISTERED
 
     if not _kernels_available():
-        logger.debug("oq_a8: kernels unavailable; patch skipped")
+        logger.warning(
+            "oq_a8: kernels unavailable; patch skipped, stock kernels in use"
+        )
         return False
 
     floor = _MIN_TOKENS_DEFAULT

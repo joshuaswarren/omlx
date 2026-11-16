@@ -476,7 +476,10 @@ class BatchedEngine(BaseEngine):
 
             apply_qwen35_moe_router_patch()
         except Exception:
-            logger.debug("Qwen MoE router patch not applied", exc_info=True)
+            logger.warning(
+                "Qwen MoE router patch not applied; using stock path",
+                exc_info=True,
+            )
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
@@ -504,7 +507,10 @@ class BatchedEngine(BaseEngine):
 
                 apply_sdpa256_attention_patch()
             except Exception:
-                logger.debug("sdpa256 attention patch not applied", exc_info=True)
+                logger.warning(
+                    "sdpa256 attention patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen3.5/3.6 head_dim=256 causal prefill -> native steel FA kernel.
         # Strictly shape-gated; decode, quantized-cache paths, and unsupported
@@ -520,7 +526,10 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_fa256_attention_patch()
             except Exception:
-                logger.debug("Qwen FA-256 steel patch not applied", exc_info=True)
+                logger.warning(
+                    "Qwen FA-256 steel patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Qwen3.5/3.6 q4 prefill linears -> native qmm tile tuned for long
         # batches. Strictly gated in the patch; decode and unsupported linears
@@ -538,7 +547,10 @@ class BatchedEngine(BaseEngine):
                 apply_qwen35_q4_mlp_patch()
                 apply_qwen35_q4_lm_prefill_linear_patch()
             except Exception:
-                logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
+                logger.warning(
+                    "Qwen q4 MLP prefill patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
@@ -557,7 +569,10 @@ class BatchedEngine(BaseEngine):
                     ),
                 )
             except Exception:
-                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+                logger.warning(
+                    "oQ A8 prefill patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
@@ -714,7 +729,10 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_moe_weighted_sum_patch()
             except Exception:
-                logger.debug("Qwen MoE weighted-sum patch not applied", exc_info=True)
+                logger.warning(
+                    "Qwen MoE weighted-sum patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         if (
             getattr(self._model_settings, "qwen35_ragged_decode_fallback_enabled", True)
@@ -727,7 +745,10 @@ class BatchedEngine(BaseEngine):
 
                 apply_qwen35_ragged_decode_patch()
             except Exception:
-                logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+                logger.warning(
+                    "qwen3_5 ragged decode patch not applied; using stock path",
+                    exc_info=True,
+                )
 
         # Create engine config (copy to avoid mutating the shared instance)
         scheduler_config = (
