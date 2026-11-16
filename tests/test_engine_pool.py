@@ -14,6 +14,7 @@ import mlx.core as mx
 import pytest
 
 import omlx.engine_pool as engine_pool_module
+from omlx.engine.base import GenerationOutput
 from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
@@ -5832,3 +5833,95 @@ class TestIsMetalOutOfMemory:
         outer.__cause__ = oom
 
         assert is_metal_out_of_memory(outer) is True
+
+
+class _CanaryStubEngine:
+    """Engine-shaped stub for minefield 116 canary tests.
+
+    Real token ids from ``tokenizer.encode`` and an async ``generate`` entry,
+    matching the shape the load-time forward canary looks for. With the
+    default tokenizer, ``generate`` raises to simulate a dtype or kernel
+    mismatch on the very first forward pass.
+    """
+
+    def __init__(self, tokenizer=None):
+        self.tokenizer = tokenizer or SimpleNamespace(
+            encode=lambda text: [15496]
+        )
+        self.start = AsyncMock()
+        self.stop = AsyncMock()
+        self.generate = AsyncMock(
+            side_effect=ValueError("simulated dtype mismatch on first forward")
+        )
+
+    def set_generate(self, func):
+        # Plain async def: the canary's coroutine-function check drives it.
+        self.generate = func
+
+
+class TestLoadForwardCanary:
+    """Minefield 116: a successful model load must prove the first forward.
+
+    ``_validate_llm_engine_ready`` only checked engine presence and a usable
+    tokenizer, so a dtype or kernel mismatch surfaced on the first user
+    request. The load path now drives one short greedy generate canary and
+    turns any exception or non-finite output into a load failure. Stubs whose
+    tokenizer does not encode to real token ids skip the canary so mock-based
+    pool tests stay green.
+    """
+
+    async def test_raising_generate_fails_load_validation(self):
+        """A drivable generate that raises must fail the canary with ModelLoadingError."""
+        pool = _make_pool()
+        engine = _CanaryStubEngine()
+
+        async def _raise(prompt, **kwargs):
+            raise ValueError("simulated dtype mismatch on first forward")
+
+        engine.set_generate(_raise)
+        # Unfixed behavior: validation passes the stub without any forward.
+        pool._validate_llm_engine_ready("mf-116", engine)
+        with pytest.raises(ModelLoadingError, match="forward canary"):
+            await pool._run_load_forward_canary(engine, "mf-116")
+
+    async def test_non_finite_output_fails_load_validation(self):
+        from omlx.request import TokenLogprob
+
+        pool = _make_pool()
+        engine = _CanaryStubEngine()
+
+        async def _nan_output(prompt, **kwargs):
+            return GenerationOutput(
+                text="ok",
+                logprobs=[
+                    TokenLogprob(
+                        token_id=1, text="ok", token_bytes=[], logprob=float("nan")
+                    )
+                ],
+            )
+        engine.set_generate(_nan_output)
+        with pytest.raises(ModelLoadingError, match="non-finite"):
+            await pool._run_load_forward_canary(engine, "mf-116")
+
+    async def test_magicmock_tokenizer_skips_canary(self, small_mock_model_dir):
+        """A mock tokenizer (no real token ids) skips the canary; load succeeds."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        engine = _CanaryStubEngine(tokenizer=MagicMock())
+        with patch("omlx.engine_pool.BatchedEngine", return_value=engine):
+            await pool._load_engine("model-a")
+        assert entry.engine is engine
+        engine.generate.assert_not_called()
+
+    async def test_load_engine_drives_canary(self, small_mock_model_dir):
+        """_load_engine runs the canary; a raising forward fails the load."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        with patch("omlx.engine_pool.BatchedEngine", return_value=_CanaryStubEngine()):
+            # The pool's standard load-failure path converts the canary's
+            # ModelLoadingError into the cached ModelUnavailableError.
+            with pytest.raises(ModelUnavailableError, match="forward canary"):
+                await pool._load_engine("model-a")
+        assert entry.engine is None
