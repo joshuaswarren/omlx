@@ -18,6 +18,7 @@ import copy
 import gc
 import json
 import logging
+import math
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -2460,6 +2461,74 @@ class EnginePool:
                 f"Model '{model_id}' loaded without a usable tokenizer.",
             )
 
+    async def _run_load_forward_canary(self, engine: object, model_id: str) -> None:
+        """Minefield 116: prove the first-forward dtype path at load time.
+
+        A successful load plus usable tokenizer exercises no forward pass, so
+        a dtype or kernel mismatch surfaced only on the first user request.
+        The cluster path already drives a real generate canary at readiness
+        (``__omlx_cluster_readiness__``); single-node loads get the same proof
+        here: one short greedy generate (4 tokens). Raises ModelLoadingError
+        on exception or non-finite output; skips silently when the engine
+        cannot be driven like a real LLM (no tokenizer encoding to real token
+        ids, or no async generate entry), so stub engines in tests never run
+        it. The pool's load-failure handling converts the raised
+        ModelLoadingError into the standard cached load failure.
+        """
+        try:
+            enabled = getattr(
+                get_global_settings().server, "load_forward_canary", True
+            )
+        except Exception:  # noqa: BLE001 -- default on; never fail a load here
+            enabled = True
+        if not enabled:
+            return
+        tokenizer = getattr(engine, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        generate = getattr(engine, "generate", None)
+        if not (callable(encode) and callable(generate)):
+            return
+        try:
+            probe_ids = encode("hi")
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(probe_ids, list) or not all(
+            isinstance(token_id, int) for token_id in probe_ids
+        ):
+            return
+        if not asyncio.iscoroutinefunction(generate):
+            return
+        try:
+            output = await generate(
+                "hi",
+                max_tokens=4,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+            )
+        except Exception as exc:
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' failed the load-time forward canary: {exc}",
+            ) from exc
+        text = getattr(output, "text", None)
+        logprobs = getattr(output, "logprobs", None)
+        if not isinstance(text, str) or not isinstance(logprobs or [], list):
+            raise ModelLoadingError(
+                model_id,
+                f"Model '{model_id}' load-time forward canary returned an "
+                f"unusable result: {output!r}",
+            )
+        for token_logprob in logprobs or []:
+            value = getattr(token_logprob, "logprob", None)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ModelLoadingError(
+                    model_id,
+                    f"Model '{model_id}' load-time forward canary produced "
+                    f"non-finite output (logprob {value}); the first forward "
+                    "did not complete cleanly",
+                )
+
     def _mark_pending_unload_locked(
         self,
         model_id: str,
@@ -4455,6 +4524,7 @@ class EnginePool:
                 )
 
             self._validate_llm_engine_ready(model_id, engine)
+            await self._run_load_forward_canary(engine, model_id)
             if isinstance(engine, SplashEngine) and engine.reserved_bytes() > 0:
                 # Splash may grow into the whole budget it planned, so the
                 # pool counts that instead of the weights estimate.

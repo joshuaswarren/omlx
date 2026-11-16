@@ -219,6 +219,10 @@ class ServerSettings:
     # 5 minutes). A client that talks to the server less often than this pays
     # the first-command stall on every request; raise it to cover that gap.
     gpu_keep_warm_idle_window: float = 300.0
+    # Minefield 116: after loading an LLM/VLM engine, run one short greedy
+    # generate so the first-forward dtype path is proven at load time instead
+    # of on the first user request. Costs a few tokens per model load.
+    load_forward_canary: bool = True
 
     def max_audio_upload_bytes(self) -> int:
         """Configured audio upload limit in bytes. Non-positive sizes raise ValueError."""
@@ -271,6 +275,7 @@ class ServerSettings:
             gpu_keep_warm_idle_window=float(
                 data.get("gpu_keep_warm_idle_window", 300.0)
             ),
+            load_forward_canary=bool(data.get("load_forward_canary", True)),
         )
 
 

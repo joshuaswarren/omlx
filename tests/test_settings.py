@@ -93,6 +93,7 @@ class TestServerSettings:
             "max_image_side_length": 2048,
             "gpu_keep_warm_interval": 0.5,
             "gpu_keep_warm_idle_window": 300.0,
+            "load_forward_canary": True,
         }
 
     def test_from_dict_distributed_inference_is_opt_in(self):
