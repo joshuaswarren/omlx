@@ -813,6 +813,65 @@ class TestExternalEvalDiagnostics:
         assert status == "parse_error"
 
 
+class TestToolCallOutcome:
+    """Minefield 42: a model that answers by calling a tool returns empty
+    text; that outcome must be recorded as "tool_call" and must not count
+    as a wrong answer."""
+
+    TOOL_CALLS = [
+        {"id": "call_1", "name": "get_weather",
+         "arguments": '{"city": "Sachse"}'},
+    ]
+
+    class _Engine:
+        is_external_api = False
+        model_type = None
+
+        def __init__(self, outputs):
+            self._outputs = outputs
+            self._calls = 0
+
+        async def chat(self, messages, **kwargs):
+            output = self._outputs[self._calls]
+            self._calls += 1
+            return output
+
+    class _Bench(MMLUBenchmark):
+        def format_prompt(self, item):
+            return [{"role": "user", "content": item.get("id", "")}]
+
+    async def _run(self, output):
+        items = [
+            {"id": "q0", "answer": "A"},
+            {"id": "q1", "answer": "A"},
+        ]
+        # q0 answers by calling a tool; q1 answers by text.
+        outputs = [output, GenerationOutput(text="A", finish_reason="stop")]
+        return await self._Bench().run(self._Engine(outputs), items, batch_size=1)
+
+    async def test_tool_call_is_distinct_outcome_not_wrong(self):
+        output = GenerationOutput(
+            text="", finish_reason="tool_calls", tool_calls=self.TOOL_CALLS
+        )
+        result = await self._run(output)
+        tool_result = result.question_results[0]
+        text_result = result.question_results[1]
+
+        assert tool_result.status == "tool_call"
+        assert tool_result.tool_calls == self.TOOL_CALLS
+        # Graded only on the text answer, not dragged down by the tool call.
+        assert result.accuracy == 1.0
+        assert text_result.status is None
+        assert text_result.correct is True
+
+    async def test_tool_calls_without_finish_reason_flag_detected(self):
+        output = GenerationOutput(text="", tool_calls=self.TOOL_CALLS)
+        result = await self._run(output)
+
+        assert result.question_results[0].status == "tool_call"
+        assert result.accuracy == 1.0
+
+
 @pytest.mark.parametrize(
     "benchmark_name",
     ["humaneval", "livecodebench", "mbpp"],

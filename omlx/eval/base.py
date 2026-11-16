@@ -28,7 +28,8 @@ class QuestionResult:
     question_text: str = ""
     raw_response: str = ""
     category: Optional[str] = None
-    # Populated only for external API evaluations.
+    # External API outcome, or "tool_call" when the model answered by
+    # calling a tool instead of producing text (minefield 42).
     status: Optional[str] = None
     finish_reason: Optional[str] = None
     reasoning_fields_present: list[str] = field(default_factory=list)
@@ -36,6 +37,8 @@ class QuestionResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     error_message: str = ""
+    # Parsed tool calls for "tool_call" outcomes: {"name", "arguments"} dicts.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -248,7 +251,18 @@ class BaseBenchmark(ABC):
             "prompt_tokens": diagnostics.get("prompt_tokens", 0),
             "completion_tokens": diagnostics.get("completion_tokens", 0),
             "error_message": diagnostics.get("error_message", ""),
+            "tool_calls": diagnostics.get("tool_calls", []),
         }
+
+    @staticmethod
+    def _is_tool_call_output(output: Any) -> bool:
+        """Minefield 42: did this output answer by calling a tool?"""
+        tool_calls = getattr(output, "tool_calls", None)
+        # Engines emit a list of dicts; a bare truthy attribute (e.g. a mock's
+        # auto-created attr) must not count as a tool call.
+        return (
+            isinstance(tool_calls, list) and bool(tool_calls)
+        ) or getattr(output, "finish_reason", None) == "tool_calls"
 
     @staticmethod
     def _local_diagnostics(output: Any) -> dict[str, Any]:
@@ -301,6 +315,11 @@ class BaseBenchmark(ABC):
         raw_text is the unstripped output for auto-detection of thinking tags.
         diagnostics holds the stop reason and token counts for local engines
         and the full external response metadata for remote evaluations.
+
+        Minefield 42: when the model answers by calling a tool (non-empty
+        output.tool_calls or finish_reason == "tool_calls"), diagnostics
+        carries status "tool_call" and the parsed tool name/arguments, so the
+        empty text is not MC-graded as a wrong answer.
         """
         messages = self.format_prompt(item)
         prompt_text = "\n".join(m.get("content", "") for m in messages)
@@ -324,7 +343,8 @@ class BaseBenchmark(ABC):
                 messages=messages,
                 **kwargs,
             )
-            raw_text = output.text
+            # Tool-call outputs can carry a None text alongside the calls.
+            raw_text = output.text or ""
             text = self._strip_think_tags(raw_text)
             diagnostics: dict[str, Any] = {}
             if getattr(engine, "is_external_api", False):
@@ -345,6 +365,12 @@ class BaseBenchmark(ABC):
                 }
             else:
                 diagnostics = self._local_diagnostics(output)
+            if self._is_tool_call_output(output):
+                diagnostics["status"] = "tool_call"
+                diagnostics["tool_calls"] = [
+                    tc for tc in (getattr(output, "tool_calls", None) or [])
+                    if isinstance(tc, dict)
+                ]
             return index, item, text, prompt_text, raw_text, diagnostics
         except Exception as e:
             logger.warning(f"Engine error on question {index}: {e}")
@@ -484,10 +510,13 @@ class BaseBenchmark(ABC):
                 raise asyncio.CancelledError()
 
         ordered = [results[idx] for idx in range(total)]
-        correct = sum(1 for r in ordered if r.correct)
+        # Minefield 42: tool_call outcomes are neither correct nor wrong;
+        # score only items that were actually graded on text.
+        graded = [r for r in ordered if r.status != "tool_call"]
+        correct = sum(1 for r in graded if r.correct)
         category_correct: dict[str, int] = {}
         category_total: dict[str, int] = {}
-        for r in ordered:
+        for r in graded:
             if r.category is None:
                 continue
             category_total[r.category] = category_total.get(r.category, 0) + 1
@@ -508,7 +537,7 @@ class BaseBenchmark(ABC):
 
         return BenchmarkResult(
             benchmark_name=self.name,
-            accuracy=correct / total if total > 0 else 0.0,
+            accuracy=correct / len(graded) if graded else 0.0,
             total_questions=total,
             correct_count=correct,
             time_seconds=time.time() - start_time,
