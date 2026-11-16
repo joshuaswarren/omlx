@@ -742,6 +742,28 @@ def _drop_client_budget_markers(messages: list[dict]) -> list[dict]:
     return kept
 
 
+def _mid_system_at_preserved_boundary(messages: list[dict]) -> bool:
+    """True when a non-leading system run touches a tool result or a message
+    carrying _PRESERVE_BOUNDARY_KEY — positions where
+    _downgrade_mid_system_to_user_notes refuses to rewrite roles."""
+    seen_non_system = False
+    for i, msg in enumerate(messages):
+        if not _is_system_role(msg.get("role")):
+            seen_non_system = True
+            continue
+        if not seen_non_system:
+            continue
+        for neighbor in (
+            messages[i - 1] if i else None,
+            messages[i + 1] if i + 1 < len(messages) else None,
+        ):
+            if neighbor is not None and (
+                neighbor.get("role") == "tool" or neighbor.get(_PRESERVE_BOUNDARY_KEY)
+            ):
+                return True
+    return False
+
+
 def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
     """Move unsupported non-leading system runs into adjacent safe user text.
 
@@ -829,7 +851,9 @@ def prepare_system_messages_for_template(
 
     Model-specific templates may first relocate supported system turns to a
     native reminder role. Unsupported placements or templates then use the
-    configured strict or user-note fallback.
+    configured strict or user-note fallback. Minefield 93: when the fallback
+    applies at a tool-result/preserved-boundary position, the messages stay
+    in place (no consolidation) so renders remain prefix-stable across turns.
     """
     messages = _drop_client_budget_markers([dict(msg) for msg in messages])
     if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
@@ -847,6 +871,21 @@ def prepare_system_messages_for_template(
                 # that require a single leading system message don't fail.
                 prepared = _merge_consecutive_system_messages(prepared)
                 return _merge_consecutive_roles(prepared)
+        # Minefield 93: when the note sits next to a tool result or a
+        # role-boundary-preserved message, downgrade is impossible — but
+        # consolidating would move the per-turn note into the leading system
+        # and rewrite the whole KV prefix every turn. If the template renders
+        # mid-system messages in place, keep them there instead.
+        if (
+            not is_partial
+            and _mid_system_at_preserved_boundary(messages)
+            and chat_template_preserves_mid_system(
+                tokenizer,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        ):
+            return _merge_consecutive_system_messages(messages)
         return strict_fallback()
 
     if not is_partial and has_nonleading_system_message(messages):

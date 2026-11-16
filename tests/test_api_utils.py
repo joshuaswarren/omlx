@@ -3180,6 +3180,53 @@ class TestPrepareSystemMessagesForTemplate:
         assert [message["role"] for message in result] == ["system", "user"]
         assert result[0]["content"] == "You are an agent."
 
+    def test_tool_result_note_prefix_stable_across_turns(self):
+        """Minefield 93: consolidation must not rewrite the KV prefix.
+
+        When a per-turn system note (a clock) follows a tool result and
+        downgrade is impossible, the note must stay in place. Moving it into
+        the leading system block rewrites the entire prefix every turn and
+        destroys the cache.
+        """
+        tokenizer = self.PreserveTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Question"},
+            ]
+            for turn in range(turns):
+                messages.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": f"c{turn}",
+                                    "function": {"name": "clock", "arguments": {}},
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"c{turn}",
+                            "content": f"{12 + turn}:00",
+                        },
+                        {"role": "system", "content": f"clock: {12 + turn}:00"},
+                        {"role": "user", "content": f"Continue {turn}"},
+                    ]
+                )
+            return messages
+
+        turn1 = prepare_system_messages_for_template(conversation(1), tokenizer)
+        turn2 = prepare_system_messages_for_template(conversation(2), tokenizer)
+
+        render1 = tokenizer.apply_chat_template(turn1)
+        render2 = tokenizer.apply_chat_template(turn2)
+
+        assert render2.startswith(render1)
+
 
 class TestMergeConsecutiveRoles:
     """Tests for consecutive same-role message merging."""
