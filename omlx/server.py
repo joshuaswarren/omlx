@@ -4969,6 +4969,25 @@ def _engine_accepts_images(engine: BaseEngine) -> bool:
     )
 
 
+def _validate_tool_choice(request: ChatCompletionRequest) -> None:
+    """Reject unsupported tool_choice modes (minefield 78: fail closed).
+
+    oMLX only enforces "auto" and "none". "required" and named-function
+    choices were previously accepted and silently ignored, letting the model
+    answer in prose instead of calling the requested tool.
+    """
+    choice = request.tool_choice
+    if choice is None:
+        return
+    mode = choice.get("type") if isinstance(choice, dict) else choice
+    if mode not in ("auto", "none"):
+        raise InvalidRequestError(
+            f"tool_choice {choice!r} is not supported: oMLX only supports "
+            "'auto' and 'none'.",
+            field="tool_choice",
+        )
+
+
 def _resolve_template_tools(
     request: ChatCompletionRequest,
     engine: BaseEngine,
@@ -5059,6 +5078,7 @@ async def create_chat_completion(
     ```
     """
     _reject_lone_surrogates(request)
+    _validate_tool_choice(request)
     # Log incoming request summary at debug, message content at trace
     logger.debug(
         f"Chat completion request received: model={request.model}, "
