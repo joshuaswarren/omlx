@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from omlx.api.thinking import ThinkingParser
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -1468,3 +1469,74 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_recovers_answer_streamed_as_reasoning():
+    """mf-23: answer streamed only as reasoning must stay recoverable as content.
+
+    A rank-zero backend whose chat template pre-opens the think block files
+    the whole answer under ``reasoning`` and never sends ``content``. The
+    engine must not close the think block at finalize: ThinkingParser.finish()
+    recovers an unclosed block as content, so the answer reaches the content
+    channel the way the local engine delivers it. Closing it marks the block
+    complete and the answer is lost to the reasoning channel.
+    """
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {"role": "assistant", "reasoning": "Need lookup. "},
+                    "finish_reason": None,
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {"reasoning": "Paris is the answer."},
+                    "finish_reason": "stop",
+                }
+            ]
+        },
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 9,
+                "completion_tokens": 3,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 0},
+            },
+        },
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        assert body["stream"] is True
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=content,
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Weather?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    parser = ThinkingParser()
+    for output in outputs:
+        parser.feed(output.new_text)
+    _, recovered = parser.finish()
+    assert recovered.strip() == "Need lookup. Paris is the answer."
+    assert outputs[-1].finish_reason == "stop"
+    assert outputs[-1].tool_calls is None
