@@ -1974,6 +1974,9 @@ def merge_chat_template_request_kwargs(
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+
+    An explicitly-set toggle (mf-omlx-29) also joins the forced keys for
+    that key, so requests cannot override it; ``None`` stays overridable.
     """
     merged: dict[str, Any] = {}
     forced_keys = forced_ct_keys(settings)
@@ -1982,11 +1985,16 @@ def merge_chat_template_request_kwargs(
         if settings.chat_template_kwargs:
             merged.update(settings.chat_template_kwargs)
         # Dedicated toggles take precedence over chat_template_kwargs.
+        # mf-omlx-29: an explicitly-set toggle is an admin decision, not a
+        # default — force it so request kwargs cannot silently re-enable
+        # (or disable) thinking. None leaves the request in charge.
         if settings.enable_thinking is not None:
             merged["enable_thinking"] = settings.enable_thinking
+            forced_keys.add("enable_thinking")
         # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if settings.preserve_thinking is not None:
             merged["preserve_thinking"] = settings.preserve_thinking
+            forced_keys.add("preserve_thinking")
 
     if request_ct_kwargs:
         for key, value in request_ct_kwargs.items():
