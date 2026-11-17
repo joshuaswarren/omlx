@@ -584,6 +584,31 @@ class TestEnginePoolStatus:
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
 
+    def test_get_status_surfaces_prefix_cache_disable(self, small_mock_model_dir):
+        """Minefield 47: /v1/models/status must carry the scheduler's
+        model-wide prefix cache disable and its reason."""
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        scheduler = MagicMock()
+        scheduler.prefix_cache_status.return_value = {
+            "prefix_cache_disabled": True,
+            "prefix_cache_disabled_reason": "unsupported RingSlidingKVCache layers",
+        }
+        engine = MagicMock()
+        engine.scheduler = scheduler
+        pool._entries["model-a"].engine = engine
+
+        status = pool.get_status()
+        models = {m["id"]: m for m in status["models"]}
+        assert models["model-a"]["prefix_cache_disabled"] is True
+        assert "RingSlidingKVCache" in (
+            models["model-a"]["prefix_cache_disabled_reason"]
+        )
+        # No engine (unloaded): the flag reads False, never missing.
+        assert models["model-b"]["prefix_cache_disabled"] is False
+        assert models["model-b"]["prefix_cache_disabled_reason"] is None
+
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""
         pool = _make_pool(ceiling=10 * 1024**3)

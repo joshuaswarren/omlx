@@ -824,6 +824,73 @@ class TestSchedulerAddRequest:
         mock_model.make_cache = lambda: [type("KVCache", (), {})()]
         assert scheduler._model_has_unreconstructible_cache() is False
 
+    def test_unreconstructible_cache_disable_warns_once_with_reason(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        """Minefield 47: a model-wide prefix cache disable must WARN once
+        per model load and name the architecture and the reason — an INFO
+        line leaves operators sizing context against a cache that is off."""
+        mock_model.config.model_type = "hybrid_stub"
+        mock_model.make_cache = lambda: [type("RingSlidingKVCache", (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        with caplog.at_level("WARNING"):
+            assert scheduler._model_has_unreconstructible_cache() is True
+            # Memoized: a second call must not log again (once per model load).
+            assert scheduler._model_has_unreconstructible_cache() is True
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING"
+            and "Prefix cache" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "hybrid_stub" in message
+        assert "RingSlidingKVCache" in message
+
+    def test_prefix_cache_disabled_state_is_exposed_for_status(
+        self, mock_model, mock_tokenizer
+    ):
+        """Minefield 47: the disable must be readable for /v1/models/status."""
+        mock_model.make_cache = lambda: [type("RingSlidingKVCache", (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is True
+        status = scheduler.prefix_cache_status()
+        assert status["prefix_cache_disabled"] is True
+        assert "RingSlidingKVCache" in status["prefix_cache_disabled_reason"]
+
+    def test_prefix_cache_status_false_for_supported_models(
+        self, mock_model, mock_tokenizer
+    ):
+        """Supported cache layouts must not report a disable."""
+        mock_model.make_cache = lambda: [type("KVCache", (), {})()]
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+
+        assert scheduler._model_has_unreconstructible_cache() is False
+        assert scheduler.prefix_cache_status() == {
+            "prefix_cache_disabled": False,
+            "prefix_cache_disabled_reason": None,
+        }
+
+    def test_prefix_cache_status_clean_before_first_probe(
+        self, mock_model, mock_tokenizer
+    ):
+        """Before any request probes the cache, the status must not claim a disable."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        assert scheduler.prefix_cache_status() == {
+            "prefix_cache_disabled": False,
+            "prefix_cache_disabled_reason": None,
+        }
+
     def test_add_request_under_pressure_skips_hot_cache_preload_and_promotion(
         self, mock_model, mock_tokenizer
     ):
