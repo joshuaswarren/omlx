@@ -11099,15 +11099,40 @@ class Scheduler:
         result = False
         for layer in layers:
             if not self._cache_layer_is_reconstructible(layer):
-                logger.info(
-                    "Prefix cache storage and reuse disabled: unsupported %s layers",
-                    type(layer).__name__,
+                # Minefield 47: a model-wide disable at INFO is invisible to
+                # operators sizing context and batch limits. WARN once per
+                # model load (the probe is memoized) and name the
+                # architecture and the reason.
+                arch = getattr(
+                    getattr(self.model, "config", None), "model_type", None
+                )
+                if not isinstance(arch, str):
+                    arch = type(self.model).__name__
+                reason = f"unsupported {type(layer).__name__} layers"
+                logger.warning(
+                    "Prefix cache storage and reuse disabled for %s: %s "
+                    "cannot be reconstructed",
+                    arch,
+                    reason,
                 )
                 result = True
                 break
 
         self._unreconstructible_cache_model = result
+        self._prefix_cache_disabled_reason = reason if result else None
         return result
+
+    def prefix_cache_status(self) -> dict:
+        """Model-wide prefix cache disable state for status payloads (minefield 47)."""
+        disabled = getattr(self, "_unreconstructible_cache_model", None) is True
+        return {
+            "prefix_cache_disabled": disabled,
+            "prefix_cache_disabled_reason": (
+                getattr(self, "_prefix_cache_disabled_reason", None)
+                if disabled
+                else None
+            ),
+        }
 
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
