@@ -1021,6 +1021,51 @@ class TestCompletionEndpoint:
         assert len(data["choices"]) > 0
         assert "text" in data["choices"][0]
 
+    def test_completion_rejects_echo_and_logprobs(self, client):
+        """echo/logprobs on /v1/completions must fail loudly (minefield 15).
+
+        The request model does not implement either parameter. Accepting
+        them silently returns plain text, which grades every lm-eval
+        multiple-choice option the same. A 400 naming the parameter lets
+        clients fall back instead of reading a wrong-looking number."""
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello, world!",
+                "echo": True,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "echo" in response.json()["error"]["message"]
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello, world!",
+                "logprobs": 5,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "logprobs" in response.json()["error"]["message"]
+
+        # The guard must run before the streaming branch too.
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello, world!",
+                "stream": True,
+                "logprobs": 1,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "logprobs" in response.json()["error"]["message"]
+
     def test_completion_response_format(self, client):
         """Test completion response has correct format."""
         response = client.post(
