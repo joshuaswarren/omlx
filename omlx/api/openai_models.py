@@ -555,6 +555,11 @@ class CompletionRequest(BaseModel):
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
     gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
+    # OpenAI parameters oMLX accepts but does not implement on this route:
+    # the route rejects them with a 400 so clients fail loudly instead of
+    # silently getting plain text back (minefield 15).
+    echo: Optional[bool] = None
+    logprobs: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
